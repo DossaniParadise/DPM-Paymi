@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.1",
+  version: "3.2",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -686,6 +686,43 @@ function effectiveChainStatus(inv, chain) {
   return chain.status;
 }
 
+/* One row per PENDING chain that has blown its window — a snapshot of who
+   is sitting on what, right now. Sorted most-overdue first. */
+function buildOverdueRows(invoices, now) {
+  const rows = [];
+  invoices.forEach(inv => {
+    getChains(inv).forEach(chain => {
+      if (chain.status !== "PENDING") return;
+      const sla = slaState(chain, now);
+      if (!sla || sla.level !== "late") return;
+      const step = chainCurrentStep(chain);
+      const hoursPerDay = BH.endHour - BH.startHour;
+      const overH = Math.max(0, sla.usedH - SLA_HOURS);
+      rows.push({
+        _overH: overH,
+        "Waiting On": step ? step.name : "",
+        "Role": step ? step.label : chain.currentStage,
+        "Overdue By": overH >= hoursPerDay
+          ? (overH / hoursPerDay).toFixed(1) + " business days"
+          : overH.toFixed(1) + " business hours",
+        "Was Due": sla.dueAt ? new Date(sla.dueAt).toLocaleString() : "",
+        "Vendor": inv.vendor || "",
+        "Invoice #": inv.invoiceNumber || "",
+        "Amount": Number(inv.amount) || 0,
+        "Store": chain.storeName || "",
+        "Store #": chain.storeNumber || "",
+        "Division": chain.division || "",
+        "Stage Since": chain.stageEnteredAt ? new Date(chain.stageEnteredAt).toLocaleString() : "",
+        "Invoice Created": inv.createdAt ? new Date(inv.createdAt).toLocaleString() : "",
+        "Created By": inv.createdByName || ""
+      });
+    });
+  });
+  rows.sort((a, b) => b._overH - a._overH);
+  rows.forEach(r => { delete r._overH; });
+  return rows;
+}
+
 function buildReportRows(invoices, f) {
   // f: { startMs, endMs, statuses:Set, vendor, dmId, doId }
   const rows = [];
@@ -1028,7 +1065,7 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
         </FilterGroup>
 
         <div className="w-px h-4 bg-[#e0dbd3]" />
-        <FilterGroup label="Approver">
+        <FilterGroup label="Waiting on">
           <select value={filters.approver} onChange={e => set("approver", e.target.value)}
                   className={sel + " max-w-[150px]"}>
             <option value="">Anyone</option>
@@ -2103,6 +2140,24 @@ function ReportPanel({ invoices, users }) {
     setMsg("✓ Exported " + rows.length + " row" + (rows.length > 1 ? "s" : "") + ".");
   }
 
+  // Snapshot of everything past its deadline RIGHT NOW — no date range or
+  // filters needed; it answers "who is sitting on what" in one click.
+  function downloadOverdue() {
+    setMsg("");
+    if (!window.XLSX) { setMsg("The Excel library didn't load — check your connection and reload."); return; }
+    const rows = buildOverdueRows(invoices, Date.now());
+    if (!rows.length) { setMsg("✓ Nothing is overdue right now — nobody's slacking."); return; }
+    const ws = window.XLSX.utils.json_to_sheet(rows);
+    ws["!cols"] = Object.keys(rows[0]).map(k => ({
+      wch: Math.min(40, Math.max(k.length, ...rows.map(r => String(r[k] ?? "").length)) + 2)
+    }));
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "Overdue");
+    const d = new Date(), pad = x => String(x).padStart(2, "0");
+    window.XLSX.writeFile(wb, "ap-overdue_" + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + ".xlsx");
+    setMsg("✓ Exported " + rows.length + " overdue approval" + (rows.length > 1 ? "s" : "") + ".");
+  }
+
   const statusOpts = ["PENDING", "APPROVED", "REJECTED", "PAID"];
 
   return (
@@ -2172,6 +2227,11 @@ function ReportPanel({ invoices, users }) {
         <button onClick={download}
           className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
           Download Excel report
+        </button>
+        <button onClick={downloadOverdue}
+          title="Snapshot of every approval currently past its deadline, worst first"
+          className="rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50">
+          ⏰ Overdue approvals report
         </button>
         {msg && <span className={"text-sm " + (msg.startsWith("✓") ? "text-emerald-700" : "text-red-700")}>{msg}</span>}
       </div>
@@ -2476,8 +2536,8 @@ function App() {
       if (filters.division && i.division !== filters.division) return false;
       if (filters.store && i.storeId !== filters.store &&
           !(i.storeIds || []).includes(filters.store)) return false;
-      if (filters.approver && !getChains(i).some(c => (c.steps || [])
-            .some(s => (s.userIds || []).includes(filters.approver)))) return false;
+      if (filters.approver && !getChains(i).some(c =>
+            canActOnChain({ id: filters.approver }, c))) return false;
       if (q && !((i.vendor || "").toLowerCase().includes(q) ||
                  (i.invoiceNumber || "").toLowerCase().includes(q) ||
                  (i.storeName || "").toLowerCase().includes(q))) return false;
