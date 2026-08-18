@@ -394,17 +394,40 @@ function getChains(inv) {
    Audience: everyone named in a PENDING or REJECTED chain.
    Your own comments never count as unread for you.
    ============================================================ */
+/* One person can hold SEVERAL ids here — IT signs in as "admin:<email>" but is
+   named in rate steps as "rate:it". Checking a single id meant the audience
+   test failed for the identity you happened to sign in with, so the comment was
+   invisible in PayMi and could never be marked read — while FixMi, which checks
+   every id, kept insisting you had unread comments. Always resolve the full set. */
+function identityIdsFor(user) {
+  if (!user || !user.id) return [];
+  const ids = [user.id];
+  const email = (user.email || "").toLowerCase();
+  // the rate-reviewer alias for this same human, and vice versa
+  Object.values(CFG.rateReviewers || {}).forEach(r => {
+    if (!r) return;
+    if ((r.email || "").toLowerCase() === email) {
+      if (!ids.includes(r.id)) ids.push(r.id);
+      const adminId = "admin:" + (r.email || "").toLowerCase();
+      if (!ids.includes(adminId)) ids.push(adminId);
+    }
+  });
+  return ids;
+}
 function commentAudienceIncludes(userId, inv) {
+  const ids = Array.isArray(userId) ? userId : [userId];
   return getChains(inv).some(c =>
     (c.status === "PENDING" || c.status === "REJECTED") &&
-    (c.steps || []).some(st => (st.userIds || []).includes(userId)));
+    (c.steps || []).some(st => (st.userIds || []).some(u => ids.includes(u))));
 }
 
 function unreadCommentsFor(userId, inv) {
-  if (!userId || !commentAudienceIncludes(userId, inv)) return 0;
-  const readAt = (inv.commentReads || {})[userId] || 0;
+  const ids = Array.isArray(userId) ? userId : [userId];
+  if (!ids.length || !commentAudienceIncludes(ids, inv)) return 0;
+  // Reading under ANY of my identities counts as read — mirrors FixMi's max().
+  const readAt = Math.max(0, ...ids.map(id => (inv.commentReads || {})[id] || 0));
   return (inv.commentLog || []).filter(e =>
-    e && e.by !== userId && (e.ts || 0) > readAt).length;
+    e && !ids.includes(e.by) && (e.ts || 0) > readAt).length;
 }
 
 // Top-level invoice status derived from its chains.
@@ -1745,11 +1768,14 @@ function CommentThread({ invoiceId, inv, currentUser, canPost }) {
   // Seeing the conversation IS reading it: when this thread is on screen and
   // holds unread comments, mark them read automatically. (Impersonated
   // sessions never write, so viewing-as leaves the person's count intact.)
+  const myIds = identityIdsFor(currentUser);
   const unreadHere = inv && !currentUser._sim
-    ? unreadCommentsFor(currentUser.id, inv) : 0;
+    ? unreadCommentsFor(myIds, inv) : 0;
   useEffect(() => {
     if (unreadHere > 0) {
-      commentService.markRead(invoiceId, currentUser.id).catch(() => {});
+      // Stamp EVERY identity, so the banner clears no matter which id the
+      // chain named or which one FixMi checks.
+      myIds.forEach(id => commentService.markRead(invoiceId, id).catch(() => {}));
     }
   }, [unreadHere, invoiceId]);
 
@@ -1983,9 +2009,9 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
               <Pill tone="ok">{approved} of {chains.length} approved</Pill>
             )}
             {inv.status === "REJECTED" && <Pill tone="late">All chains rejected</Pill>}
-            {!currentUser._sim && unreadCommentsFor(currentUser.id, inv) > 0 && (
+            {!currentUser._sim && unreadCommentsFor(identityIdsFor(currentUser), inv) > 0 && (
               <span className="rounded-full border border-sky-300 bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
-                💬 {unreadCommentsFor(currentUser.id, inv)} new
+                💬 {unreadCommentsFor(identityIdsFor(currentUser), inv)} new
               </span>
             )}
             {chains.length > 1 && inv.status === "PENDING" && (approved > 0 || rejected > 0) && (
@@ -2577,7 +2603,7 @@ function App() {
   // first. Includes ones they've already approved — a question asked after
   // your approval is often the one that matters most.
   const unread  = visible
-    .map(i => ({ inv: i, n: unreadCommentsFor(session.id, i) }))
+    .map(i => ({ inv: i, n: unreadCommentsFor(identityIdsFor(session), i) }))
     .filter(x => x.n > 0)
     .sort((a, b) => (b.inv.lastCommentAt || 0) - (a.inv.lastCommentAt || 0));
   const unreadTotal = unread.reduce((n, x) => n + x.n, 0);
