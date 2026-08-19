@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.2",
+  version: "3.3",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -437,6 +437,129 @@ function unreadCommentsFor(userId, inv) {
 function deriveStatus(chains) {
   if (chains.some(c => c.status === "PENDING")) return "PENDING";
   return chains.some(c => c.status === "APPROVED") ? "APPROVED" : "REJECTED";
+}
+
+/* ============================================================
+   APPROVAL PATH REPAIR
+   People leave; FindMi gets updated; in-flight chains go stale.
+   This rebuilds the CURRENT and FUTURE steps of every PENDING
+   chain from the live directory. Rules:
+   - Completed steps are history — never touched.
+   - Approved / rejected / paid chains are records — never touched.
+   - Rate Verification and VP steps are config, not directory —
+     untouched (except VP dedupe below).
+   - If the store no longer has a DM (or DO), that step is dropped
+     and the chain waits on the next stage instead.
+   - If the person the chain is CURRENTLY waiting on changed, the
+     SLA clock restarts — the new approver gets a fresh window.
+   - If a new Director IS the VP, a later VP step is dropped so
+     the same person isn't asked twice.
+   - Stores missing from the directory are skipped and reported.
+   ============================================================ */
+function repairChainAgainstDirectory(chain, store, users, now) {
+  if (chain.status !== "PENDING") return null;
+  if (!store) return { skipped: "store no longer in the directory — left unchanged" };
+
+  const nameOf = id => (users[id] && users[id].name) || "Unknown";
+  const curIdx = (chain.steps || []).findIndex(st => st.role === chain.currentStage);
+  if (curIdx < 0) return { skipped: "current stage not found in its own steps — left unchanged" };
+
+  const changes = [];
+  let clockReset = false;
+  const label = chain.storeName || store.name || "store";
+
+  // New Director id up-front, for the VP-dedupe rule.
+  const newDirId = store.directorId && users[store.directorId] ? store.directorId : null;
+  const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
+
+  const newSteps = [];
+  (chain.steps || []).forEach((step, idx) => {
+    if (idx < curIdx) { newSteps.push(step); return; }   // history
+
+    if (step.role === "AREA_COACH") {
+      const ids = (store.acIds || []).filter(id => users[id]);
+      if (!ids.length) {
+        changes.push(label + ": District Manager step removed — no DM on this store now");
+        return;                                          // dropped
+      }
+      const same = ids.length === (step.userIds || []).length &&
+                   ids.every(id => (step.userIds || []).includes(id));
+      if (same) { newSteps.push(step); return; }
+      changes.push(label + ": District Manager " +
+        (step.name || "?") + " → " + ids.map(nameOf).join(" or "));
+      newSteps.push({ ...step, userIds: ids, userId: ids[0],
+                      name: ids.map(nameOf).join(" or ") });
+      return;
+    }
+
+    if (step.role === "DIRECTOR") {
+      if (!newDirId) {
+        changes.push(label + ": Director step removed — no Director on this store now");
+        return;
+      }
+      if ((step.userIds || []).includes(newDirId) && (step.userIds || []).length === 1) {
+        newSteps.push(step); return;
+      }
+      changes.push(label + ": Director " + (step.name || "?") + " → " + nameOf(newDirId));
+      newSteps.push({ ...step, userIds: [newDirId], userId: newDirId, name: nameOf(newDirId) });
+      return;
+    }
+
+    if (step.role === "VP" && newDirId && vpIds.includes(newDirId)) {
+      changes.push(label + ": VP step removed — the new Director is the VP");
+      return;
+    }
+
+    newSteps.push(step);                                 // RATE_REVIEW, VP
+  });
+
+  if (!changes.length) return null;
+
+  // Where does the chain wait now? Passed steps were pushed by reference, so
+  // anything not in the passed slice is at-or-after the current stage.
+  const passed = (chain.steps || []).slice(0, curIdx);
+  const firstOpen = newSteps.find(st => !passed.includes(st));
+  if (!firstOpen) return { skipped: "no approvers left for this chain — left unchanged" };
+
+  const newStage = newSteps.some(st => st.role === chain.currentStage)
+    ? chain.currentStage : firstOpen.role;
+
+  const cur = newSteps.find(st => st.role === newStage);
+  const oldCur = chain.steps[curIdx];
+  if (newStage !== chain.currentStage ||
+      JSON.stringify((cur.userIds || []).slice().sort()) !==
+      JSON.stringify((oldCur.userIds || []).slice().sort())) {
+    clockReset = true;
+  }
+
+  return {
+    changes, clockReset,
+    newChain: { ...chain, steps: newSteps, currentStage: newStage,
+                stageEnteredAt: clockReset ? now : chain.stageEnteredAt }
+  };
+}
+
+function buildPathRepairs(invoices, stores, users, now) {
+  const byId = {}; stores.forEach(st => { byId[st.id] = st; });
+  const out = [];
+  invoices.forEach(inv => {
+    if (inv.status !== "PENDING") return;
+    const chains = getChains(inv);
+    if (chains.some(c => c._legacy)) return;
+    let touched = false, clockReset = false;
+    const changes = [], skips = [];
+    const newChains = chains.map(c => {
+      const r = repairChainAgainstDirectory(c, byId[c.storeId], users, now);
+      if (!r) return c;
+      if (r.skipped) { skips.push((c.storeName || "store") + ": " + r.skipped); return c; }
+      touched = true;
+      clockReset = clockReset || r.clockReset;
+      changes.push(...r.changes);
+      return r.newChain;
+    });
+    if (touched || skips.length) out.push({ inv, newChains, changes, skips, clockReset, touched });
+  });
+  return out;
 }
 
 function chainCurrentStep(chain) {
@@ -2350,7 +2473,118 @@ function VendorRoutingPanel({ invoices, vendorRules, currentUser }) {
   );
 }
 
-function SettingsPanel({ invoices, users, vendorRules, currentUser }) {
+function PathRepairPanel({ invoices, stores, users, currentUser }) {
+  const [scan, setScan] = useState(null);      // null | [] | proposals
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState("");
+
+  function runScan() {
+    setDone("");
+    setScan(buildPathRepairs(invoices, stores, users, Date.now()));
+  }
+
+  async function commit() {
+    if (!scan) return;
+    setBusy(true);
+    let okCount = 0, failCount = 0;
+    for (const p of scan.filter(x => x.touched)) {
+      try {
+        const ts = Date.now();
+        await invoiceService.update(p.inv.id, {
+          chains: p.newChains, status: deriveStatus(p.newChains), updatedAt: ts
+        });
+        // One conversation note per repaired invoice, so approvers see WHY
+        // this landed on (or left) their plate.
+        try {
+          await commentService.add(p.inv.id, currentUser,
+            "Approval path updated from the directory: " + p.changes.join("; ") +
+            (p.clockReset ? ". The approval clock restarted for the new approver." : "."),
+            p.inv);
+        } catch (e) { /* path is fixed; a failed note is non-fatal */ }
+        okCount++;
+      } catch (e) { failCount++; }
+    }
+    setBusy(false);
+    setScan(null);
+    setDone("✓ Repaired " + okCount + " invoice" + (okCount === 1 ? "" : "s") +
+            (failCount ? " — " + failCount + " failed, rescan to retry" : "") + ".");
+  }
+
+  const touched = (scan || []).filter(x => x.touched);
+  const skippedOnly = (scan || []).filter(x => !x.touched && x.skips.length);
+
+  return (
+    <div className="rounded-xl border bg-white p-5 shadow-sm">
+      <h2 className="text-sm font-semibold text-slate-900">Approval path repair</h2>
+      <p className="mt-1 text-sm text-slate-500">
+        When people change in FindMi, in-flight invoices keep their old
+        approvers. This rebuilds pending chains from the live directory —
+        completed steps and closed invoices are never touched. Review the
+        changes, then commit.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button onClick={runScan} disabled={busy}
+          className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+          Scan for stale paths
+        </button>
+        {scan && touched.length > 0 && (
+          <button onClick={commit} disabled={busy}
+            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">
+            {busy ? "Committing…" : "Commit " + touched.length + " repair" + (touched.length === 1 ? "" : "s")}
+          </button>
+        )}
+        {done && <span className="text-sm text-emerald-700">{done}</span>}
+      </div>
+
+      {scan && touched.length === 0 && skippedOnly.length === 0 && (
+        <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          ✓ Every pending approval path matches the current directory.
+        </p>
+      )}
+
+      {scan && touched.length > 0 && (
+        <div className="mt-3 max-h-96 space-y-2 overflow-y-auto pr-1">
+          {touched.map((p, i) => (
+            <div key={i} className="rounded-lg border border-amber-200 bg-amber-50/60 px-3 py-2">
+              <p className="text-sm font-medium text-slate-900">
+                {p.inv.vendor}{p.inv.invoiceNumber ? " · #" + p.inv.invoiceNumber : ""}
+                <span className="ml-2 font-normal text-slate-500">
+                  ${Number(p.inv.amount).toLocaleString()}
+                </span>
+                {p.clockReset && (
+                  <span className="ml-2 rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-semibold text-sky-800">
+                    clock restarts
+                  </span>
+                )}
+              </p>
+              <ul className="mt-1 space-y-0.5">
+                {p.changes.map((c, ci) => (
+                  <li key={ci} className="text-xs text-slate-700">→ {c}</li>
+                ))}
+                {p.skips.map((c, ci) => (
+                  <li key={"s" + ci} className="text-xs italic text-slate-400">⚠ {c}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {scan && skippedOnly.length > 0 && (
+        <div className="mt-2">
+          {skippedOnly.map((p, i) => (
+            <p key={i} className="text-xs italic text-slate-400">
+              ⚠ {p.inv.vendor}{p.inv.invoiceNumber ? " #" + p.inv.invoiceNumber : ""}: {p.skips.join("; ")}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsPanel({ invoices, stores, users, vendorRules, currentUser }) {
   const [check, setCheck] = useState(null);
   const [checking, setChecking] = useState(false);
   async function run() {
@@ -2360,6 +2594,8 @@ function SettingsPanel({ invoices, users, vendorRules, currentUser }) {
   }
   return (
     <div className="space-y-4">
+      <PathRepairPanel invoices={invoices} stores={stores} users={users} currentUser={currentUser} />
+
       <VendorRoutingPanel invoices={invoices} vendorRules={vendorRules} currentUser={currentUser} />
 
       <div className="rounded-xl border bg-white p-5 shadow-sm">
@@ -2843,7 +3079,7 @@ function App() {
       </nav>
 
       {tab === "settings" && canSeeAll ? (
-        <SettingsPanel invoices={invoices} users={dir.users}
+        <SettingsPanel invoices={invoices} stores={dir.stores} users={dir.users}
                        vendorRules={vendorRules} currentUser={session} />
       ) : (
       <div className="space-y-3">
