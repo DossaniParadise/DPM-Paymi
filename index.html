@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.4",
+  version: "3.5",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -250,6 +250,15 @@ const directoryService = {
       entity: r.entity || "",        // legal entity, e.g. "Al's Quick Stop Inc."
       address: r.address || ""
     })).sort((a, b) => a.name.localeCompare(b.name));
+
+    // DPM Office: a virtual "store" for corporate invoices (rent, software,
+    // HQ utilities…). It has no directory approvers — Finance picks the
+    // approver chain per invoice on the upload screen.
+    stores.push({
+      id: OFFICE_STORE_ID, name: "DPM Office", storeNumber: "",
+      entity: "Dossani Paradise Management", division: "Office",
+      acIds: [], directorId: null, storeManager: "", email: ""
+    });
 
     return { users, stores };
   }
@@ -585,6 +594,60 @@ function buildPathRepairs(invoices, stores, users, now) {
     if (touched || skips.length) out.push({ inv, newChains, changes, skips, clockReset, touched });
   });
   return out;
+}
+
+const OFFICE_STORE_ID = "dpm-office";
+
+/* DPM Office chains are hand-picked: Finance chooses the approvers, in
+   order, and each becomes a sequential step. The house VP rule still holds —
+   $2,500+ appends Sam unless he's already one of the chosen. */
+function officeApproverOptions(users) {
+  const opts = [];
+  Object.values(users || {}).forEach(u => {
+    if (u.role === "AREA_COACH" || u.role === "DIRECTOR") {
+      opts.push({ key: u.id, ids: [u.id], name: u.name, roleLabel: roleLabel(u.role) });
+    }
+  });
+  // Usman signs from either identity; Rahim from his rate login.
+  const it = CFG.rateReviewers.IT, ra = CFG.rateReviewers.RAHIM;
+  opts.push({ key: it.id, ids: [it.id, "admin:" + it.email.toLowerCase()],
+              name: it.name, roleLabel: "IT" });
+  opts.push({ key: ra.id, ids: [ra.id], name: ra.name, roleLabel: "Rate Approver" });
+  return opts.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildOfficeChain(approverKeys, amount, users, now) {
+  const opts = officeApproverOptions(users);
+  const byKey = {}; opts.forEach(o => { byKey[o.key] = o; });
+  const chosen = (approverKeys || []).map(k => byKey[k]).filter(Boolean);
+
+  const steps = chosen.map((o, i) => ({
+    role: "OFFICE_" + (i + 1),
+    label: "Approver " + (i + 1) + (o.roleLabel ? " · " + o.roleLabel : ""),
+    userIds: o.ids, userId: o.ids[0], name: o.name
+  }));
+
+  if (amount >= CFG.vpThreshold) {
+    const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
+    const already = steps.some(st => st.userIds.some(id => vpIds.includes(id)));
+    if (!already) {
+      steps.push({
+        role: "VP", label: "VP of Ops",
+        userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
+        note: "Invoice total $" + CFG.vpThreshold.toLocaleString() + "+"
+      });
+    }
+  }
+
+  return {
+    storeId: OFFICE_STORE_ID, storeName: "DPM Office", storeNumber: "",
+    entity: "Dossani Paradise Management", division: "Office",
+    steps,
+    status: steps.length ? "PENDING" : "REJECTED",
+    currentStage: steps.length ? steps[0].role : "NONE",
+    stageEnteredAt: steps.length ? now : null,
+    history: []
+  };
 }
 
 function chainCurrentStep(chain) {
@@ -1609,8 +1672,21 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
   useEffect(() => { setRateOverride(null); }, [vendor]);
   const rateRule = rateOverride || vendorRuleFor(vendor, { rules: vendorRules });
 
-  const previewChains = selStores.length
-    ? buildChains(selStores, amt, users, Date.now(), rateRule) : [];
+  // ---- DPM Office: Finance hand-picks the approver chain, in order. ----
+  const officeSelected = storeIds.includes(OFFICE_STORE_ID);
+  const [officeApprovers, setOfficeApprovers] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("ap_office_approvers") || "[]"); }
+    catch (e) { return []; }
+  });
+  const officeOpts = useMemo(() => officeApproverOptions(users), [users]);
+  const onlyOffice = selStores.length > 0 && selStores.every(st => st.id === OFFICE_STORE_ID);
+
+  function chainsFor(when) {
+    return selStores.map(st => st.id === OFFICE_STORE_ID
+      ? buildOfficeChain(officeApprovers, amt, users, when)
+      : buildChains([st], amt, users, when, rateRule)[0]);
+  }
+  const previewChains = selStores.length ? chainsFor(Date.now()) : [];
 
   function pickFile() {
     setErr("");
@@ -1652,9 +1728,12 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
       "). It was not uploaded again.");
 
     const now = Date.now();
-    const chains = buildChains(selStores, amt, users, now, rateRule);
+    if (officeSelected && officeApprovers.length === 0 && amt < CFG.vpThreshold)
+      return setErr("Choose at least one approver for DPM Office.");
+    const chains = chainsFor(now);
     if (chains.every(c => !c.steps.length))
       return setErr("No approvers found for these stores — check the directory.");
+    try { localStorage.setItem("ap_office_approvers", JSON.stringify(officeApprovers)); } catch (e) {}
 
     setBusy(true);
     try {
@@ -1712,7 +1791,7 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
           <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
             Approval path
           </h3>
-          <div className="mt-3 rounded-lg bg-slate-50 p-3">
+          <div className="mt-3 rounded-lg bg-slate-50 p-3" style={onlyOffice ? { display: "none" } : undefined}>
             <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
               Second approver (after DM)
             </p>
@@ -1817,6 +1896,47 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
               <StorePicker stores={stores} selectedIds={storeIds} onChange={setStoreIds} />
             </div>
           </label>
+
+          {officeSelected && (
+            <div className="rounded-lg border border-violet-200 bg-violet-50/60 p-3">
+              <p className="text-sm font-medium text-slate-800">DPM Office approvers</p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                They sign in the order listed{amt >= CFG.vpThreshold
+                  ? "; " + CFG.vp.name + " is added automatically at $" +
+                    CFG.vpThreshold.toLocaleString() + "+" : ""}.
+              </p>
+              {officeApprovers.length > 0 && (
+                <ol className="mt-2 space-y-1">
+                  {officeApprovers.map((k, i) => {
+                    const o = officeOpts.find(x => x.key === k);
+                    if (!o) return null;
+                    return (
+                      <li key={k} className="flex items-center gap-2">
+                        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-violet-600 text-[11px] font-semibold text-white">
+                          {i + 1}
+                        </span>
+                        <span className="text-sm text-slate-800">{o.name}</span>
+                        <span className="text-xs text-slate-400">{o.roleLabel}</span>
+                        <button type="button"
+                          onClick={() => setOfficeApprovers(officeApprovers.filter(x => x !== k))}
+                          className="ml-auto rounded px-1.5 text-slate-400 hover:bg-violet-100 hover:text-slate-700">
+                          ✕
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+              <select value=""
+                onChange={e => { if (e.target.value) setOfficeApprovers([...officeApprovers, e.target.value]); }}
+                className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
+                <option value="">+ Add an approver…</option>
+                {officeOpts.filter(o => !officeApprovers.includes(o.key)).map(o => (
+                  <option key={o.key} value={o.key}>{o.name} — {o.roleLabel}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <label className="text-sm">
             <span className="text-slate-600">Vendor</span>
