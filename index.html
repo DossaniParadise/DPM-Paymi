@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.5",
+  version: "3.7",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -118,7 +118,9 @@ window.APP_CONFIG = {
   ],
 
   // Routing rules
-  vpThreshold: 2500,      // >= this amount adds the VP step
+  vpThreshold: 2500,      // BOOTSTRAP DEFAULT ONLY — the live value comes
+                          // from Firestore (Settings → Approval thresholds)
+                          // and overrides this the moment the app connects.
 
   // --- SLA clock ------------------------------------------------------------
   // The clock only counts business time: Mon-Fri, 08:00-17:00 local. It does
@@ -329,16 +331,22 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
   }
 
   if (store.directorId && users[store.directorId]) {
-    const dirStep = {
-      role: "DIRECTOR", label: "Director of Ops",
-      userIds: [store.directorId], userId: store.directorId,
-      name: nameOf(store.directorId)
-    };
-    if (!acIds.length) dirStep.note = "No District Manager — starts here";
-    steps.push(dirStep);
+    // Per-Director threshold: skip the DO on small invoices — but ONLY when
+    // a DM is on the chain. A Director who is the only approver always stays.
+    const doMin = directorThresholdFor(store.directorId);
+    const skipDO = doMin > 0 && amount < doMin && acIds.length > 0;
+    if (!skipDO) {
+      const dirStep = {
+        role: "DIRECTOR", label: "Director of Ops",
+        userIds: [store.directorId], userId: store.directorId,
+        name: nameOf(store.directorId)
+      };
+      if (!acIds.length) dirStep.note = "No District Manager — starts here";
+      steps.push(dirStep);
+    }
   }
 
-  if (amount >= CFG.vpThreshold) {
+  if (amount >= getVpThreshold()) {
     // Sam is also the assigned DIRECTOR for C-Store/car wash stores under a
     // different id; skip the duplicate VP step in THIS chain when he already
     // appears in it.
@@ -348,7 +356,7 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
       steps.push({
         role: "VP", label: "VP of Ops",
         userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + CFG.vpThreshold.toLocaleString() + "+"
+        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
       });
     }
   }
@@ -506,6 +514,14 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
         changes.push(label + ": Director step removed — no Director on this store now");
         return;
       }
+      const doMin = directorThresholdFor(newDirId);
+      const hasDM = (chain.steps || []).some(st => st.role === "AREA_COACH");
+      if (doMin > 0 && (amount || 0) < doMin && hasDM) {
+        changes.push(label + ": Director step removed — $" +
+          (Number(amount) || 0).toLocaleString() + " is under " + nameOf(newDirId) +
+          "'s $" + doMin.toLocaleString() + " threshold");
+        return;
+      }
       if ((step.userIds || []).includes(newDirId) && (step.userIds || []).length === 1) {
         newSteps.push(step); return;
       }
@@ -522,6 +538,54 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
     newSteps.push(step);                                 // RATE_REVIEW, VP
   });
 
+  // ---- Threshold reconciliation on the rebuilt open portion ----
+  const passedSlice = (chain.steps || []).slice(0, curIdx);
+  const amtNum = Number(amount) || 0;
+
+  // Director missing but now warranted: store has a DO, the amount clears
+  // their threshold, and no DIRECTOR stage exists or has passed.
+  if (newDirId &&
+      !(chain.steps || []).some(st => st.role === "DIRECTOR") &&
+      !newSteps.some(st => st.role === "DIRECTOR") &&
+      amtNum >= directorThresholdFor(newDirId)) {
+    const dirStep = {
+      role: "DIRECTOR", label: "Director of Ops",
+      userIds: [newDirId], userId: newDirId, name: nameOf(newDirId)
+    };
+    // Slot before an open VP step; otherwise at the end.
+    const vpIdx = newSteps.findIndex(st => st.role === "VP" && !passedSlice.includes(st));
+    if (vpIdx >= 0) newSteps.splice(vpIdx, 0, dirStep); else newSteps.push(dirStep);
+    changes.push(label + ": Director step added — " + nameOf(newDirId) +
+      " now covers this store" +
+      (directorThresholdFor(newDirId) > 0
+        ? " and $" + amtNum.toLocaleString() + " meets their $" +
+          directorThresholdFor(newDirId).toLocaleString() + " threshold" : ""));
+  }
+
+  // VP required by the current threshold but absent (and Sam isn't already
+  // in the chain under either identity):
+  if (amtNum >= getVpThreshold() &&
+      !newSteps.some(st => st.role === "VP") &&
+      !newSteps.some(st => (st.userIds || []).some(id => vpIds.includes(id)))) {
+    newSteps.push({
+      role: "VP", label: "VP of Ops",
+      userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
+      note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
+    });
+    changes.push(label + ": VP step added — $" + amtNum.toLocaleString() +
+      " is at or above the $" + getVpThreshold().toLocaleString() + " VP threshold");
+  }
+
+  // VP no longer required: drop an OPEN VP step (a signed one is history).
+  if (amtNum < getVpThreshold()) {
+    const vpOpenIdx = newSteps.findIndex(st => st.role === "VP" && !passedSlice.includes(st));
+    if (vpOpenIdx >= 0) {
+      newSteps.splice(vpOpenIdx, 1);
+      changes.push(label + ": VP step removed — $" + amtNum.toLocaleString() +
+        " is under the $" + getVpThreshold().toLocaleString() + " VP threshold");
+    }
+  }
+
   if (!changes.length) return null;
 
   // Where does the chain wait now? Passed steps were pushed by reference, so
@@ -530,23 +594,23 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   let firstOpen = newSteps.find(st => !passed.includes(st));
 
   // Every remaining approver was removed from the directory. The rule:
-  //   under $2,500  -> the collected signatures stand; the chain completes.
-  //   $2,500 and up -> Sam (VP) must sign; route to him if he hasn't already.
+  //   under the live VP threshold -> collected signatures stand; completes.
+  //   at/above it -> Sam (VP) must sign; route to him if he hasn't already.
   if (!firstOpen) {
-    if ((amount || 0) >= CFG.vpThreshold) {
+    if ((amount || 0) >= getVpThreshold()) {
       const vpStep = {
         role: "VP", label: "VP of Ops",
         userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + CFG.vpThreshold.toLocaleString() + "+"
+        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
       };
       newSteps.push(vpStep);
       firstOpen = vpStep;
       changes.push(label + ": no DM or Director remains — routed to " +
         CFG.vp.name + " (VP) because the invoice total is $" +
-        CFG.vpThreshold.toLocaleString() + "+");
+        getVpThreshold().toLocaleString() + "+");
     } else {
       changes.push(label + ": no approvers remain and the total is under $" +
-        CFG.vpThreshold.toLocaleString() + " — completed with the signatures already collected");
+        getVpThreshold().toLocaleString() + " — completed with the signatures already collected");
       return { changes, autoApprove: true, newSteps };
     }
   }
@@ -569,13 +633,60 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   };
 }
 
+/* Chain integrity audit — the report-only companion to path repair. Catches
+   what auto-repair can't or shouldn't fix by itself, so the AP team can
+   verify EVERYTHING before declaring the system healthy:
+   - legacy-format invoices (predate per-store chains; repair skips them)
+   - open steps waiting on someone who no longer exists anywhere (the classic
+     case: a hand-picked DPM Office approver who left the company)
+   - pending chains with no SLA clock (stageEnteredAt missing — due dates
+     and the overdue report can't see them)
+   - invoice status that disagrees with its own chains (drift; auto-fixable
+     and offered as a repair)
+*/
+function approverIdResolves(id, users) {
+  if (!id) return false;
+  if (users[id]) return true;
+  if (String(id).indexOf("rate:") === 0) return true;      // config identities
+  if (String(id).indexOf("admin:") === 0) return true;
+  if (id === CFG.vp.id || id === CFG.vp.directoryId) return true;
+  return false;
+}
+
+function auditChains(invoices, users) {
+  const legacy = [], orphaned = [], noClock = [], drift = [];
+  invoices.forEach(inv => {
+    const chains = getChains(inv);
+    if (chains.some(c => c._legacy)) { legacy.push(inv); return; }
+
+    // Status drift applies to any invoice, open or closed.
+    const expected = deriveStatus(chains);
+    const eff = inv.status === "PAID" ? "PAID" : inv.status;   // PAID is finance's call, never drift
+    if (eff !== "PAID" && expected !== inv.status) drift.push({ inv, expected });
+
+    chains.forEach(chain => {
+      if (chain.status !== "PENDING") return;
+      const curIdx = (chain.steps || []).findIndex(st => st.role === chain.currentStage);
+      (chain.steps || []).forEach((step, idx) => {
+        if (idx < curIdx) return;                              // history
+        const ids = step.userIds || [];
+        if (!ids.length || !ids.some(id => approverIdResolves(id, users))) {
+          orphaned.push({ inv, chain, step });
+        }
+      });
+      if (!chain.stageEnteredAt) noClock.push({ inv, chain });
+    });
+  });
+  return { legacy, orphaned, noClock, drift };
+}
+
 function buildPathRepairs(invoices, stores, users, now) {
   const byId = {}; stores.forEach(st => { byId[st.id] = st; });
   const out = [];
   invoices.forEach(inv => {
     if (inv.status !== "PENDING") return;
     const chains = getChains(inv);
-    if (chains.some(c => c._legacy)) return;
+    if (chains.some(c => c._legacy)) return;   // audited separately
     let touched = false, clockReset = false;
     const changes = [], skips = [];
     const newChains = chains.map(c => {
@@ -600,7 +711,7 @@ const OFFICE_STORE_ID = "dpm-office";
 
 /* DPM Office chains are hand-picked: Finance chooses the approvers, in
    order, and each becomes a sequential step. The house VP rule still holds —
-   $2,500+ appends Sam unless he's already one of the chosen. */
+   the live VP threshold appends Sam unless he's already chosen. */
 function officeApproverOptions(users) {
   const opts = [];
   Object.values(users || {}).forEach(u => {
@@ -627,14 +738,14 @@ function buildOfficeChain(approverKeys, amount, users, now) {
     userIds: o.ids, userId: o.ids[0], name: o.name
   }));
 
-  if (amount >= CFG.vpThreshold) {
+  if (amount >= getVpThreshold()) {
     const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
     const already = steps.some(st => st.userIds.some(id => vpIds.includes(id)));
     if (!already) {
       steps.push({
         role: "VP", label: "VP of Ops",
         userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + CFG.vpThreshold.toLocaleString() + "+"
+        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
       });
     }
   }
@@ -786,6 +897,35 @@ function viewAsRoster(dir) {
    Colour is always derived from stageEnteredAt, never stored, so
    it cannot go stale in the database.
    ============================================================ */
+/* ============================================================
+   LIVE THRESHOLDS — single source of truth is Firestore
+   (doc "_config_thresholds" in the invoices collection), not
+   this file. RUNTIME holds the last-received values; CFG only
+   seeds the bootstrap default for the moments before the first
+   snapshot arrives.
+     vpThreshold          — invoices at/above this get the VP step.
+     directorThresholds   — per-Director minimums, keyed by the
+                            director's directory id. A Director is
+                            SKIPPED on invoices under their number,
+                            but only when a District Manager is on
+                            the chain — a Director who is the only
+                            approver stays regardless, so no invoice
+                            is left with nobody.
+   ============================================================ */
+const RUNTIME = { vpThreshold: CFG.vpThreshold, directorThresholds: {} };
+
+function applyThresholdConfig(doc) {
+  RUNTIME.vpThreshold = (doc && Number(doc.vpThreshold) > 0)
+    ? Number(doc.vpThreshold) : CFG.vpThreshold;
+  RUNTIME.directorThresholds = (doc && doc.directorThresholds) || {};
+}
+
+function getVpThreshold() { return RUNTIME.vpThreshold; }
+function directorThresholdFor(directorId) {
+  const v = Number((RUNTIME.directorThresholds || {})[directorId]);
+  return isFinite(v) && v > 0 ? v : 0;      // 0 = involved on everything
+}
+
 const BH = CFG.businessHours;
 
 function isBusinessDay(d) {
@@ -1049,6 +1189,20 @@ async function probeFirestore() {
 }
 
 const VENDOR_RULES_DOC = "_config_vendorRules";
+const THRESHOLDS_DOC   = "_config_thresholds";
+
+const thresholdsService = {
+  async save(vpThreshold, directorThresholds, user) {
+    await window.FS.setDoc(window.FS.doc(window.FS.db, "invoices", THRESHOLDS_DOC), {
+      _config: true,
+      vpThreshold: Number(vpThreshold) || CFG.vpThreshold,
+      directorThresholds: directorThresholds || {},
+      createdAt: 0,          // keeps it inside the createdAt-ordered subscription
+      updatedAt: Date.now(),
+      updatedBy: user ? user.name : ""
+    });
+  }
+};
 
 const vendorRulesService = {
   async save(rules, user) {
@@ -1728,7 +1882,7 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
       "). It was not uploaded again.");
 
     const now = Date.now();
-    if (officeSelected && officeApprovers.length === 0 && amt < CFG.vpThreshold)
+    if (officeSelected && officeApprovers.length === 0 && amt < getVpThreshold())
       return setErr("Choose at least one approver for DPM Office.");
     const chains = chainsFor(now);
     if (chains.every(c => !c.steps.length))
@@ -1862,14 +2016,14 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
                      c.steps.some(st => st.role === "AREA_COACH") && (
                       <p className="mt-1 text-xs text-amber-700">
                         ⚠ No Director on this store — the chain completes after the
-                        District Manager{amt >= CFG.vpThreshold ? " and the VP" : ""}.
+                        District Manager{amt >= getVpThreshold() ? " and the VP" : ""}.
                       </p>
                     )}
                     </>
                   ) : (
                     <p className="mt-2 text-sm text-red-700">
                       No approvers on file — this chain cannot route. (At $
-                      {CFG.vpThreshold.toLocaleString()}+ it would go straight to the VP.)
+                      {getVpThreshold().toLocaleString()}+ it would go straight to the VP.)
                     </p>
                   )}
                 </div>
@@ -1901,9 +2055,9 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
             <div className="rounded-lg border border-violet-200 bg-violet-50/60 p-3">
               <p className="text-sm font-medium text-slate-800">DPM Office approvers</p>
               <p className="mt-0.5 text-xs text-slate-500">
-                They sign in the order listed{amt >= CFG.vpThreshold
+                They sign in the order listed{amt >= getVpThreshold()
                   ? "; " + CFG.vp.name + " is added automatically at $" +
-                    CFG.vpThreshold.toLocaleString() + "+" : ""}.
+                    getVpThreshold().toLocaleString() + "+" : ""}.
               </p>
               {officeApprovers.length > 0 && (
                 <ol className="mt-2 space-y-1">
@@ -2628,6 +2782,99 @@ function VendorRoutingPanel({ invoices, vendorRules, currentUser }) {
   );
 }
 
+function ThresholdsPanel({ users, thresholds, currentUser }) {
+  const [vpDraft, setVpDraft] = useState(null);          // string while editing
+  const [doDraft, setDoDraft] = useState(null);          // {dirId: string}
+  const [msg, setMsg] = useState("");
+
+  const directors = useMemo(() =>
+    Object.values(users || {})
+      .filter(u => u.role === "DIRECTOR")
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    [users]);
+
+  const vpVal = vpDraft !== null ? vpDraft : String(thresholds.vpThreshold);
+  const doVal = id => {
+    if (doDraft && id in doDraft) return doDraft[id];
+    const v = (thresholds.directorThresholds || {})[id];
+    return v ? String(v) : "";
+  };
+  const dirty = vpDraft !== null || doDraft !== null;
+
+  async function save() {
+    setMsg("");
+    const vp = Number(vpVal);
+    if (!(vp > 0)) { setMsg("The VP threshold must be a positive amount."); return; }
+    const dts = {};
+    directors.forEach(d => {
+      const raw = doVal(d.id).trim();
+      const n = Number(raw);
+      if (raw && n > 0) dts[d.id] = n;
+    });
+    try {
+      await thresholdsService.save(vp, dts, currentUser);
+      setVpDraft(null); setDoDraft(null);
+      setMsg("✓ Saved. New invoices route with these numbers immediately; run " +
+             "Approval path repair above to reconcile pending ones.");
+    } catch (e) { setMsg("Couldn't save: " + (e.message || "error")); }
+  }
+
+  return (
+    <div className="rounded-xl border bg-white p-5 shadow-sm">
+      <h2 className="text-sm font-semibold text-slate-900">Approval thresholds</h2>
+      <p className="mt-1 text-sm text-slate-500">
+        Stored in the database, read live by every device — this file carries
+        no baked-in numbers. The VP joins chains at or above his threshold. A
+        Director with a threshold is skipped on invoices under it, <span
+        className="font-medium">but only when a District Manager is on the
+        chain</span> — a Director who is the only approver always stays.
+      </p>
+
+      <div className="mt-4 flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2">
+        <div>
+          <p className="text-sm font-medium text-slate-800">{CFG.vp.name} — VP of Ops</p>
+          <p className="text-xs text-slate-500">Required at or above this amount</p>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="text-sm text-slate-500">$</span>
+          <input inputMode="numeric" value={vpVal}
+            onChange={e => { setMsg(""); setVpDraft(e.target.value.replace(/[^0-9]/g, "")); }}
+            className="w-24 rounded-lg border border-slate-300 px-2 py-1.5 text-right text-sm" />
+        </div>
+      </div>
+
+      <p className="mt-4 text-xs font-medium uppercase tracking-wide text-slate-500">
+        Per-Director minimums <span className="normal-case font-normal">(blank = involved on everything)</span>
+      </p>
+      <div className="mt-1.5 max-h-72 space-y-1 overflow-y-auto pr-1">
+        {directors.map(d => (
+          <div key={d.id} className="flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2">
+            <span className="min-w-0 truncate text-sm text-slate-800">{d.name}</span>
+            <div className="flex shrink-0 items-center gap-1">
+              <span className="text-sm text-slate-400">$</span>
+              <input inputMode="numeric" value={doVal(d.id)} placeholder="0"
+                onChange={e => { setMsg(""); setDoDraft({ ...(doDraft || {}),
+                  [d.id]: e.target.value.replace(/[^0-9]/g, "") }); }}
+                className="w-24 rounded-lg border border-slate-300 px-2 py-1.5 text-right text-sm" />
+            </div>
+          </div>
+        ))}
+        {directors.length === 0 && (
+          <p className="text-sm text-slate-400">No Directors found in the directory.</p>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button type="button" onClick={save} disabled={!dirty}
+          className="rounded-lg bg-slate-900 px-4 py-1.5 text-sm font-medium text-white disabled:opacity-40">
+          Save thresholds
+        </button>
+        {msg && <span className={"text-sm " + (msg.startsWith("✓") ? "text-emerald-700" : "text-red-700")}>{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
 function PathRepairPanel({ invoices, stores, users, currentUser }) {
   const [scan, setScan] = useState(null);      // null | [] | proposals
   const [busy, setBusy] = useState(false);
@@ -2635,14 +2882,27 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
 
   function runScan() {
     setDone("");
-    setScan(buildPathRepairs(invoices, stores, users, Date.now()));
+    setScan({
+      repairs: buildPathRepairs(invoices, stores, users, Date.now()),
+      audit: auditChains(invoices, users),
+      at: Date.now(),
+      scanned: invoices.filter(i => i.status === "PENDING").length,
+      chainsScanned: invoices.reduce((n, i) => n + getChains(i).length, 0)
+    });
   }
 
   async function commit() {
     if (!scan) return;
     setBusy(true);
     let okCount = 0, failCount = 0;
-    for (const p of scan.filter(x => x.touched)) {
+    // Status drift is auto-fixable: recompute from the chains.
+    for (const d of scan.audit.drift) {
+      try {
+        await invoiceService.update(d.inv.id, { status: d.expected, updatedAt: Date.now() });
+        okCount++;
+      } catch (e) { failCount++; }
+    }
+    for (const p of scan.repairs.filter(x => x.touched)) {
       try {
         const ts = Date.now();
         await invoiceService.update(p.inv.id, {
@@ -2665,8 +2925,13 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
             (failCount ? " — " + failCount + " failed, rescan to retry" : "") + ".");
   }
 
-  const touched = (scan || []).filter(x => x.touched);
-  const skippedOnly = (scan || []).filter(x => !x.touched && x.skips.length);
+  const touched = scan ? scan.repairs.filter(x => x.touched) : [];
+  const skippedOnly = scan ? scan.repairs.filter(x => !x.touched && x.skips.length) : [];
+  const audit = scan ? scan.audit : null;
+  const attention = audit
+    ? audit.legacy.length + audit.orphaned.length + audit.noClock.length : 0;
+  const fixable = touched.length + (audit ? audit.drift.length : 0);
+  const allClean = scan && fixable === 0 && attention === 0 && skippedOnly.length === 0;
 
   // Screenshot-friendly summary: each distinct change, grouped, with how many
   // invoices it touches. Change strings already lead with the store name.
@@ -2676,9 +2941,13 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
       if (!m.has(c)) m.set(c, new Set());
       m.get(c).add(p.inv.id);
     }));
-    return [...m.entries()]
+    const out = [...m.entries()]
       .map(([desc, ids]) => ({ desc, n: ids.size }))
       .sort((a, b) => a.desc.localeCompare(b.desc));
+    if (audit && audit.drift.length) {
+      out.push({ desc: "Status corrected to match chain outcomes", n: audit.drift.length });
+    }
+    return out;
   }, [scan]);
 
   return (
@@ -2696,30 +2965,70 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
           className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
           Scan for stale paths
         </button>
-        {scan && touched.length > 0 && (
+        {scan && fixable > 0 && (
           <button onClick={commit} disabled={busy}
             className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">
-            {busy ? "Submitting…" : "Submit updates (" + touched.length + " invoice" + (touched.length === 1 ? "" : "s") + ")"}
+            {busy ? "Submitting…" : "Submit updates (" + fixable + " invoice" + (fixable === 1 ? "" : "s") + ")"}
           </button>
         )}
         {done && <span className="text-sm text-emerald-700">{done}</span>}
       </div>
 
-      {scan && touched.length === 0 && skippedOnly.length === 0 && (
-        <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-          ✓ Every pending approval path matches the current directory.
-        </p>
+      {allClean && (
+        <div className="mt-3 rounded-xl border-2 border-emerald-300 bg-emerald-50 p-4">
+          <p className="text-sm font-bold text-emerald-900">
+            ✅ Verified clean — {new Date(scan.at).toLocaleString()}
+          </p>
+          <p className="mt-1 text-sm text-emerald-800">
+            Scanned {scan.scanned} pending invoice{scan.scanned === 1 ? "" : "s"} ({scan.chainsScanned} chain{scan.chainsScanned === 1 ? "" : "s"} total)
+            against the live directory and thresholds.
+          </p>
+          <ul className="mt-1.5 space-y-0.5 text-xs text-emerald-800">
+            <li>✓ Every approver on every open step exists and is current</li>
+            <li>✓ Director and VP steps match the live thresholds</li>
+            <li>✓ No orphaned, legacy, clock-less, or status-drifted invoices</li>
+          </ul>
+        </div>
       )}
 
-      {scan && touched.length > 0 && (
+      {audit && attention > 0 && (
+        <div className="mt-3 rounded-xl border-2 border-red-300 bg-red-50 p-4">
+          <p className="text-sm font-bold text-red-900">
+            ⚠ Needs attention — can't be fixed automatically
+          </p>
+          <ul className="mt-1.5 space-y-1">
+            {audit.orphaned.map((o, i) => (
+              <li key={"o" + i} className="text-xs text-red-800">
+                • {o.inv.vendor}{o.inv.invoiceNumber ? " #" + o.inv.invoiceNumber : ""} — {o.chain.storeName}:
+                {" "}the "{o.step.label}" step waits on {o.step.name || "an unknown person"}, who no longer
+                exists in the directory. Reassign (re-file, or approve on their behalf via View-as) — it will
+                never move on its own.
+              </li>
+            ))}
+            {audit.legacy.map((inv, i) => (
+              <li key={"l" + i} className="text-xs text-red-800">
+                • {inv.vendor}{inv.invoiceNumber ? " #" + inv.invoiceNumber : ""} — legacy format
+                (predates per-store chains). Re-file it to bring it under current routing.
+              </li>
+            ))}
+            {audit.noClock.map((o, i) => (
+              <li key={"c" + i} className="text-xs text-red-800">
+                • {o.inv.vendor}{o.inv.invoiceNumber ? " #" + o.inv.invoiceNumber : ""} — {o.chain.storeName}:
+                pending with no SLA clock; due dates and the overdue report can't track it.
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {scan && fixable > 0 && (
         <div className="mt-3 rounded-xl border-2 border-sky-300 bg-sky-50 p-4">
           <p className="text-sm font-bold text-sky-900">
             📋 Approval path update — {new Date().toLocaleDateString(undefined,
               { weekday: "short", month: "short", day: "numeric", year: "numeric" })}
           </p>
           <p className="mt-0.5 text-xs text-sky-800">
-            The following store paths will be updated across {touched.length} pending
-            invoice{touched.length === 1 ? "" : "s"}:
+            The following updates will be applied across {fixable} invoice{fixable === 1 ? "" : "s"}:
           </p>
           <ul className="mt-2 space-y-1">
             {storeSummary.map((x, i) => (
@@ -2782,7 +3091,7 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
   );
 }
 
-function SettingsPanel({ invoices, stores, users, vendorRules, currentUser }) {
+function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, currentUser }) {
   const [check, setCheck] = useState(null);
   const [checking, setChecking] = useState(false);
   async function run() {
@@ -2793,6 +3102,8 @@ function SettingsPanel({ invoices, stores, users, vendorRules, currentUser }) {
   return (
     <div className="space-y-4">
       <PathRepairPanel invoices={invoices} stores={stores} users={users} currentUser={currentUser} />
+
+      <ThresholdsPanel users={users} thresholds={thresholds} currentUser={currentUser} />
 
       <VendorRoutingPanel invoices={invoices} vendorRules={vendorRules} currentUser={currentUser} />
 
@@ -2819,7 +3130,7 @@ function SettingsPanel({ invoices, stores, users, vendorRules, currentUser }) {
         <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
           <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2">
             <dt className="text-slate-500">VP threshold</dt>
-            <dd className="text-slate-700">${CFG.vpThreshold.toLocaleString()}+</dd>
+            <dd className="text-slate-700">${getVpThreshold().toLocaleString()}+</dd>
           </div>
           <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2">
             <dt className="text-slate-500">Turnaround target</dt>
@@ -2858,6 +3169,8 @@ function App() {
   const [approverScreen, setApproverScreen] = useState("hub");   // "hub" | storeId
   const [financeScreen, setFinanceScreen] = useState("dashboard"); // "dashboard" | "new" | "report"
   const [vendorRules, setVendorRules] = useState({});   // vendor -> "NONE"|"IT"|"RAHIM"
+  const [thresholds, setThresholds] = useState(
+    { vpThreshold: RUNTIME.vpThreshold, directorThresholds: {} });
   const [filters, setFilters]   = useState({ status: "", division: "", store: "", approver: "", q: "" });
   // Invoices carrying comments this person hasn't read. The audience is wider
   // than the approval queue — you stay in it after approving — so these can sit
@@ -2888,9 +3201,14 @@ function App() {
       unsub = invoiceService.subscribe(docs => {
         // The vendor-routing rules live as a config doc inside the same
         // collection; peel it off before anything treats it as an invoice.
-        const cfgDoc = docs.find(d => d.id === VENDOR_RULES_DOC || d._config);
-        if (cfgDoc) setVendorRules(cfgDoc.rules || {});
-        setInvoices(docs.filter(d => d.id !== VENDOR_RULES_DOC && !d._config));
+        const vr = docs.find(d => d.id === VENDOR_RULES_DOC);
+        if (vr) setVendorRules(vr.rules || {});
+        const th = docs.find(d => d.id === THRESHOLDS_DOC);
+        applyThresholdConfig(th || null);
+        setThresholds({ vpThreshold: RUNTIME.vpThreshold,
+                        directorThresholds: RUNTIME.directorThresholds });
+        setInvoices(docs.filter(d =>
+          d.id !== VENDOR_RULES_DOC && d.id !== THRESHOLDS_DOC && !d._config));
       }, e => setErr("Firestore: " + e.message));
     }
     if (window.FS) start();
@@ -3278,7 +3596,7 @@ function App() {
 
       {tab === "settings" && canSeeAll ? (
         <SettingsPanel invoices={invoices} stores={dir.stores} users={dir.users}
-                       vendorRules={vendorRules} currentUser={session} />
+                       vendorRules={vendorRules} thresholds={thresholds} currentUser={session} />
       ) : (
       <div className="space-y-3">
         {tab === "unread" && shown.length > 0 && (
