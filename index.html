@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.7",
+  version: "3.8",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -309,7 +309,7 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
   const steps = [];
   const nameOf = id => (users[id] && users[id].name) || "Unknown";
 
-  const acIds = (store.acIds || []).filter(id => users[id]);
+  const acIds = effectiveAcIds(store).filter(id => users[id]);
   if (acIds.length) {
     steps.push({
       role: "AREA_COACH", label: "District Manager (DM)",
@@ -330,16 +330,17 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
     });
   }
 
-  if (store.directorId && users[store.directorId]) {
+  const effDirId = effectiveDirectorId(store);
+  if (effDirId && users[effDirId]) {
     // Per-Director threshold: skip the DO on small invoices — but ONLY when
     // a DM is on the chain. A Director who is the only approver always stays.
-    const doMin = directorThresholdFor(store.directorId);
+    const doMin = directorThresholdFor(effDirId);
     const skipDO = doMin > 0 && amount < doMin && acIds.length > 0;
     if (!skipDO) {
       const dirStep = {
         role: "DIRECTOR", label: "Director of Ops",
-        userIds: [store.directorId], userId: store.directorId,
-        name: nameOf(store.directorId)
+        userIds: [effDirId], userId: effDirId,
+        name: nameOf(effDirId)
       };
       if (!acIds.length) dirStep.note = "No District Manager — starts here";
       steps.push(dirStep);
@@ -485,8 +486,10 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   let clockReset = false;
   const label = chain.storeName || store.name || "store";
 
-  // New Director id up-front, for the VP-dedupe rule.
-  const newDirId = store.directorId && users[store.directorId] ? store.directorId : null;
+  // New Director id up-front, for the VP-dedupe rule. Effective = the
+  // directory's Director, or the Settings stand-in for a store missing one.
+  const effDir = effectiveDirectorId(store);
+  const newDirId = effDir && users[effDir] ? effDir : null;
   const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
 
   const newSteps = [];
@@ -494,7 +497,7 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
     if (idx < curIdx) { newSteps.push(step); return; }   // history
 
     if (step.role === "AREA_COACH") {
-      const ids = (store.acIds || []).filter(id => users[id]);
+      const ids = effectiveAcIds(store).filter(id => users[id]);
       if (!ids.length) {
         changes.push(label + ": District Manager step removed — no DM on this store now");
         return;                                          // dropped
@@ -541,6 +544,24 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   // ---- Threshold reconciliation on the rebuilt open portion ----
   const passedSlice = (chain.steps || []).slice(0, curIdx);
   const amtNum = Number(amount) || 0;
+
+  // DM missing but now available (directory hire or Settings stand-in), and
+  // the chain hasn't passed where the DM would sit (its first stage):
+  const effAcs = effectiveAcIds(store).filter(id => users[id]);
+  let dmPrepended = false;
+  if (effAcs.length &&
+      !(chain.steps || []).some(st => st.role === "AREA_COACH") &&
+      curIdx === 0 && (chain.history || []).every(h => h.action !== "APPROVE")) {
+    dmPrepended = true;
+    const nameJoin = effAcs.map(nameOf).join(" or ");
+    newSteps.unshift({
+      role: "AREA_COACH", label: "District Manager (DM)",
+      userIds: effAcs, userId: effAcs[0], name: nameJoin,
+      hint: undefined, note: "Has this work been completed?"
+    });
+    changes.push(label + ": District Manager step added — " + nameJoin +
+      " now covers this store");
+  }
 
   // Director missing but now warranted: store has a DO, the amount clears
   // their threshold, and no DIRECTOR stage exists or has passed.
@@ -615,8 +636,9 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
     }
   }
 
-  const newStage = newSteps.some(st => st.role === chain.currentStage)
+  let newStage = newSteps.some(st => st.role === chain.currentStage)
     ? chain.currentStage : firstOpen.role;
+  if (dmPrepended) newStage = "AREA_COACH";   // the chain restarts at the new DM
 
   const cur = newSteps.find(st => st.role === newStage);
   const oldCur = chain.steps[curIdx];
@@ -912,7 +934,27 @@ function viewAsRoster(dir) {
                             approver stays regardless, so no invoice
                             is left with nobody.
    ============================================================ */
-const RUNTIME = { vpThreshold: CFG.vpThreshold, directorThresholds: {} };
+const RUNTIME = { vpThreshold: CFG.vpThreshold, directorThresholds: {},
+                  pathOverrides: {} };
+
+/* Path overrides fill the gaps FindMi leaves: a store with no DM or no DO
+   can have a chosen stand-in, stored in Firestore and read live. FindMi
+   always wins when it HAS someone — overrides apply ONLY to the missing
+   slot, so fixing the directory later automatically retires the override. */
+function applyPathOverrides(doc) {
+  RUNTIME.pathOverrides = (doc && doc.overrides) || {};
+}
+function effectiveAcIds(store) {
+  const real = (store.acIds || []);
+  if (real.length) return real;
+  const ov = RUNTIME.pathOverrides[store.id];
+  return ov && ov.dm ? [ov.dm] : [];
+}
+function effectiveDirectorId(store) {
+  if (store.directorId) return store.directorId;
+  const ov = RUNTIME.pathOverrides[store.id];
+  return (ov && ov.do) || null;
+}
 
 function applyThresholdConfig(doc) {
   RUNTIME.vpThreshold = (doc && Number(doc.vpThreshold) > 0)
@@ -1190,6 +1232,19 @@ async function probeFirestore() {
 
 const VENDOR_RULES_DOC = "_config_vendorRules";
 const THRESHOLDS_DOC   = "_config_thresholds";
+const PATH_OVERRIDES_DOC = "_config_pathOverrides";
+
+const pathOverridesService = {
+  async save(overrides, user) {
+    await window.FS.setDoc(window.FS.doc(window.FS.db, "invoices", PATH_OVERRIDES_DOC), {
+      _config: true,
+      overrides: overrides || {},
+      createdAt: 0,
+      updatedAt: Date.now(),
+      updatedBy: user ? user.name : ""
+    });
+  }
+};
 
 const thresholdsService = {
   async save(vpThreshold, directorThresholds, user) {
@@ -2782,6 +2837,103 @@ function VendorRoutingPanel({ invoices, vendorRules, currentUser }) {
   );
 }
 
+function IncompletePathsPanel({ stores, users, pathOverrides, currentUser }) {
+  const [draft, setDraft] = useState(null);   // {storeId:{dm,do}} while editing
+  const [msg, setMsg] = useState("");
+
+  const dms = useMemo(() => Object.values(users || {})
+    .filter(u => u.role === "AREA_COACH").sort((a, b) => a.name.localeCompare(b.name)), [users]);
+  const dos = useMemo(() => Object.values(users || {})
+    .filter(u => u.role === "DIRECTOR").sort((a, b) => a.name.localeCompare(b.name)), [users]);
+
+  // Incomplete = FindMi itself is missing the person. Overrides don't hide a
+  // store from this list — the list IS where overrides live.
+  const incomplete = useMemo(() => (stores || [])
+    .filter(st => st.id !== OFFICE_STORE_ID &&
+                  (!(st.acIds || []).length || !st.directorId))
+    .sort((a, b) => a.name.localeCompare(b.name)), [stores]);
+
+  const cur = draft || pathOverrides || {};
+  const val = (sid, slot) => ((cur[sid] || {})[slot]) || "";
+  function setVal(sid, slot, v) {
+    setMsg("");
+    const next = { ...cur, [sid]: { ...(cur[sid] || {}), [slot]: v || undefined } };
+    if (!next[sid].dm && !next[sid].do) delete next[sid];
+    setDraft(next);
+  }
+  async function save() {
+    try {
+      await pathOverridesService.save(cur, currentUser);
+      setDraft(null);
+      setMsg("✓ Saved. New invoices use these stand-ins immediately; run " +
+             "Approval path repair to reconcile pending ones.");
+    } catch (e) { setMsg("Couldn't save: " + (e.message || "error")); }
+  }
+
+  return (
+    <div className="rounded-xl border bg-white p-5 shadow-sm">
+      <h2 className="text-sm font-semibold text-slate-900">Incomplete approval paths</h2>
+      <p className="mt-1 text-sm text-slate-500">
+        Every store where FindMi is missing a District Manager or a Director,
+        and who stands in for the gap. Stored in the database — the single
+        source of truth for routing. FindMi always wins once it has someone:
+        fix the directory and the stand-in retires itself. "Proceed without"
+        keeps today's short-chain behavior
+        ({CFG.vp.name} still joins at the VP threshold either way).
+      </p>
+
+      {incomplete.length === 0 ? (
+        <p className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          ✓ Every store in FindMi has both a District Manager and a Director.
+        </p>
+      ) : (
+        <div className="mt-3 max-h-96 space-y-1.5 overflow-y-auto pr-1">
+          {incomplete.map(st => (
+            <div key={st.id} className="rounded-lg bg-slate-50 px-3 py-2">
+              <p className="text-sm font-medium text-slate-800">
+                {st.name}
+                <span className="ml-2 text-xs font-normal text-slate-400">{st.division}</span>
+              </p>
+              <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
+                {!(st.acIds || []).length && (
+                  <label className="block text-xs text-slate-500">
+                    Missing District Manager — stand-in:
+                    <select value={val(st.id, "dm")}
+                      onChange={e => setVal(st.id, "dm", e.target.value)}
+                      className="mt-0.5 w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-800">
+                      <option value="">— proceed without a DM —</option>
+                      {dms.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+                    </select>
+                  </label>
+                )}
+                {!st.directorId && (
+                  <label className="block text-xs text-slate-500">
+                    Missing Director — stand-in:
+                    <select value={val(st.id, "do")}
+                      onChange={e => setVal(st.id, "do", e.target.value)}
+                      className="mt-0.5 w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-800">
+                      <option value="">— proceed without a Director —</option>
+                      {dos.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+                    </select>
+                  </label>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button type="button" onClick={save} disabled={!draft}
+          className="rounded-lg bg-slate-900 px-4 py-1.5 text-sm font-medium text-white disabled:opacity-40">
+          Save stand-ins
+        </button>
+        {msg && <span className={"text-sm " + (msg.startsWith("✓") ? "text-emerald-700" : "text-red-700")}>{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
 function ThresholdsPanel({ users, thresholds, currentUser }) {
   const [vpDraft, setVpDraft] = useState(null);          // string while editing
   const [doDraft, setDoDraft] = useState(null);          // {dirId: string}
@@ -3091,7 +3243,7 @@ function PathRepairPanel({ invoices, stores, users, currentUser }) {
   );
 }
 
-function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, currentUser }) {
+function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, pathOverrides, currentUser }) {
   const [check, setCheck] = useState(null);
   const [checking, setChecking] = useState(false);
   async function run() {
@@ -3102,6 +3254,9 @@ function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, curre
   return (
     <div className="space-y-4">
       <PathRepairPanel invoices={invoices} stores={stores} users={users} currentUser={currentUser} />
+
+      <IncompletePathsPanel stores={stores} users={users}
+                            pathOverrides={pathOverrides} currentUser={currentUser} />
 
       <ThresholdsPanel users={users} thresholds={thresholds} currentUser={currentUser} />
 
@@ -3128,10 +3283,6 @@ function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, curre
         <h2 className="text-sm font-semibold text-slate-900">Approval rules</h2>
         <p className="mt-1 text-sm text-slate-500">Current routing configuration.</p>
         <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
-          <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2">
-            <dt className="text-slate-500">VP threshold</dt>
-            <dd className="text-slate-700">${getVpThreshold().toLocaleString()}+</dd>
-          </div>
           <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2">
             <dt className="text-slate-500">Turnaround target</dt>
             <dd className="text-slate-700">{SLA_PHRASE}</dd>
@@ -3171,6 +3322,7 @@ function App() {
   const [vendorRules, setVendorRules] = useState({});   // vendor -> "NONE"|"IT"|"RAHIM"
   const [thresholds, setThresholds] = useState(
     { vpThreshold: RUNTIME.vpThreshold, directorThresholds: {} });
+  const [pathOverrides, setPathOverrides] = useState({});
   const [filters, setFilters]   = useState({ status: "", division: "", store: "", approver: "", q: "" });
   // Invoices carrying comments this person hasn't read. The audience is wider
   // than the approval queue — you stay in it after approving — so these can sit
@@ -3207,8 +3359,12 @@ function App() {
         applyThresholdConfig(th || null);
         setThresholds({ vpThreshold: RUNTIME.vpThreshold,
                         directorThresholds: RUNTIME.directorThresholds });
+        const po = docs.find(d => d.id === PATH_OVERRIDES_DOC);
+        applyPathOverrides(po || null);
+        setPathOverrides(RUNTIME.pathOverrides);
         setInvoices(docs.filter(d =>
-          d.id !== VENDOR_RULES_DOC && d.id !== THRESHOLDS_DOC && !d._config));
+          d.id !== VENDOR_RULES_DOC && d.id !== THRESHOLDS_DOC &&
+          d.id !== PATH_OVERRIDES_DOC && !d._config));
       }, e => setErr("Firestore: " + e.message));
     }
     if (window.FS) start();
@@ -3596,7 +3752,8 @@ function App() {
 
       {tab === "settings" && canSeeAll ? (
         <SettingsPanel invoices={invoices} stores={dir.stores} users={dir.users}
-                       vendorRules={vendorRules} thresholds={thresholds} currentUser={session} />
+                       vendorRules={vendorRules} thresholds={thresholds}
+                       pathOverrides={pathOverrides} currentUser={session} />
       ) : (
       <div className="space-y-3">
         {tab === "unread" && shown.length > 0 && (
