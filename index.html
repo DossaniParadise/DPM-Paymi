@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.8",
+  version: "3.9",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -64,14 +64,19 @@ window.APP_CONFIG = {
   // Directory / alignment API (read-only here)
   directoryUrl: "https://alignment-api-khaki.vercel.app/api/dpm-alignment",
 
-  // VP of Operations. There is no VP role in the directory, so the VP is named
-  // here. Sam ALSO appears in the directory as a DIRECTOR (of C-Store and car
-  // wash) under a different id. Both ids are listed so that when he is already
-  // an approver earlier in a chain we skip the duplicate VP step rather than
-  // asking the same person to sign twice.
+  // VP of Operations. The VP is a FindMi person: he lives under Support Staff
+  // (FindMi stores that list as `vps`) and ALSO appears as a DIRECTOR (of
+  // C-Store and car wash). At load time the directory adapter finds every
+  // FindMi record that belongs to him — by this id, or by this email — and the
+  // live record wins for his name, email and the set of ids he signs under.
+  // The values here are only the bootstrap/fallback for when the directory
+  // has no matching record at all.
   vp: {
-    id: "-OtoOJ1DdsHufb-We3BH",              // his real directory id
-    directoryId: "-OtoOJ1DdsHufb-We3BH",
+    id: "-1hnABbdqU-r-uuDMnsP",              // his FindMi Support Staff id — new VP steps embed this
+    directoryId: "-OtoOJ1DdsHufb-We3BH",     // LEGACY: the id older pending invoices embedded VP steps
+                                             // under (it never existed in FindMi). Kept as an alias so
+                                             // those chains still recognise him. Safe to delete once
+                                             // no pending invoice predates v3.9.
     name: "Sam Merchant",
     email: "Sam@dossaniparadise.com"
   },
@@ -82,6 +87,7 @@ window.APP_CONFIG = {
   // directory, so nobody's identity is hardcoded here.
   rolePasswords: {
     admin:    "Overwatch@76051",
+    vp:       "VP@76051",
     finance:  "AP@76051",
     director: "DO@76051",
     coach:    "DM@76051",
@@ -218,35 +224,63 @@ const directoryService = {
     const coaches   = data.areaCoaches || {};
     const directors = data.directors   || {};
     const rests     = data.restaurants || {};
+    // FindMi's Support Staff panel. FindMi still stores it under the legacy
+    // `vps` key (the panel used to be "VP of Operations"), so that is what the
+    // alignment API exposes. Records: { id, name, email, phone, jobTitle,
+    // department, deptHead }.
+    const staff     = data.vps || data.supportStaff || {};
 
     // Flat user map: id -> { id, name, email, role }
     const users = {};
     Object.values(directors).forEach(d => {
-      users[d.id] = { id: d.id, name: d.name, email: d.email || "", role: "DIRECTOR" };
+      users[d.id] = { id: d.id, name: d.name, email: (d.email || "").trim(), role: "DIRECTOR" };
     });
     Object.values(coaches).forEach(c => {
       // A person can appear as both; DIRECTOR already registered wins for role,
       // but we still want them selectable as an Area Coach approver.
       if (!users[c.id]) {
-        users[c.id] = { id: c.id, name: c.name, email: c.email || "", role: "AREA_COACH" };
+        users[c.id] = { id: c.id, name: c.name, email: (c.email || "").trim(), role: "AREA_COACH" };
       }
     });
-    // There is no VP role in the directory, so register the VP from config.
-    // If that id already exists (Sam is also a Director), keep the existing
-    // record and just note the extra role rather than overwriting it.
-    if (users[CFG.vp.id]) {
-      users[CFG.vp.id].alsoVP = true;
-    } else {
-      users[CFG.vp.id] = { id: CFG.vp.id, name: CFG.vp.name, email: CFG.vp.email, role: "VP" };
-    }
 
+    // The VP is resolved FROM the directory, not hardcoded: every FindMi record
+    // (Support Staff, Director, DM) that carries the configured VP id or the
+    // configured VP email belongs to him. His live name/email come from FindMi
+    // (Support Staff record first), and every id found is an identity he may
+    // sign under — so a Director step embedded under his director id and a VP
+    // step embedded under CFG.vp.id are both "his".
+    const vp = resolveVpFromDirectory({ staff, directors, coaches });
+    RUNTIME.vpIds = vp.ids.slice();
+    RUNTIME.vpName = vp.name;
+    RUNTIME.vpEmail = vp.email;
+    // Where new VP steps get embedded. Normally the configured id; if that id
+    // is really another person's, fall back to his own directory record.
+    RUNTIME.vpStepId = (vp.collision && vp.collision.id === CFG.vp.id)
+      ? (vp.ids.find(id => id !== CFG.vp.directoryId) || ("vp:" + vp.email))
+      : CFG.vp.id;
+    if (!RUNTIME.vpIds.includes(RUNTIME.vpStepId)) RUNTIME.vpIds.push(RUNTIME.vpStepId);
+    const stepId = RUNTIME.vpStepId;
+    if (users[stepId]) {
+      users[stepId].alsoVP = true;
+      if (!users[stepId].email && vp.email) users[stepId].email = vp.email;
+    } else {
+      users[stepId] = { id: stepId, name: vp.name, email: vp.email, role: "VP" };
+    }
+    vp.ids.forEach(id => { if (users[id]) users[id].alsoVP = true; });
+
+    // A store can point at a person who has since been DELETED from FindMi
+    // (FindMi keeps the raw id but shows the slot as unassigned). Treat it the
+    // same way here — a stale id is NOT an approver — and remember it so the
+    // path-repair scan can explain what it was.
     const stores = Object.values(rests).map(r => ({
       id: r.id,
       name: r.storeName || "(unnamed)",
       storeNumber: r.storeNumber || "",
       division: deriveDivision(r.storeName),
-      acIds: readCoachIds(r),
-      directorId: r.assignedDirectorId || null,
+      acIds: readCoachIds(r).filter(id => coaches[id]),
+      staleAcIds: readCoachIds(r).filter(id => !coaches[id]),
+      directorId: (r.assignedDirectorId && directors[r.assignedDirectorId]) ? r.assignedDirectorId : null,
+      staleDirectorId: (r.assignedDirectorId && !directors[r.assignedDirectorId]) ? r.assignedDirectorId : "",
       storeManager: r.storeManager || "",
       email: r.email || "",          // store mailbox — managers sign in with this
       entity: r.entity || "",        // legal entity, e.g. "Al's Quick Stop Inc."
@@ -262,9 +296,79 @@ const directoryService = {
       acIds: [], directorId: null, storeManager: "", email: ""
     });
 
-    return { users, stores };
+    return { users, stores, staff, vp };
   }
 };
+
+/* Find the VP in the live directory. The EMAIL is the identity: every FindMi
+   record (Support Staff first, then Directors and DMs) whose email equals the
+   configured VP email — case-insensitive, trimmed — is his. The configured id
+   is accepted too, but only when the record carrying it has no email or the
+   same email; a record with that id and SOMEONE ELSE's email is a collision
+   and is reported, never merged (that would hand another person's steps to
+   the VP). Returns { ids, name, email, fromDirectory, collision }. Falls back
+   to the config values only when FindMi has no record of him at all. */
+function resolveVpFromDirectory({ staff, directors, coaches }) {
+  const cfgEmail = (CFG.vp.email || "").trim().toLowerCase();
+  const cfgIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
+  const matches = [];
+  let collision = null;
+  const consider = (rec, source) => {
+    if (!rec || !rec.id) return;
+    const email = (rec.email || "").trim().toLowerCase();
+    const byEmail = !!cfgEmail && !!email && email === cfgEmail;
+    const byId = cfgIds.includes(rec.id);
+    if (byEmail || (byId && !email)) {
+      matches.push({ id: rec.id, name: rec.name || "", email, source });
+    } else if (byId && email !== cfgEmail) {
+      collision = { id: rec.id, name: rec.name || "", email, source };
+    }
+  };
+  Object.values(staff || {}).forEach(r => consider(r, "staff"));
+  Object.values(directors || {}).forEach(r => consider(r, "director"));
+  Object.values(coaches || {}).forEach(r => consider(r, "coach"));
+
+  const primary = matches.find(m => m.source === "staff") || matches[0] || null;
+  // The configured id is always one of his identities — that is the id VP
+  // steps are embedded under — UNLESS it turned out to belong to someone else.
+  const own = collision ? cfgIds.filter(id => id !== collision.id) : cfgIds;
+  const ids = Array.from(new Set(own.concat(matches.map(m => m.id))));
+  if (collision) {
+    console.warn("[PayMi] CFG.vp.id " + collision.id + " belongs to " +
+      (collision.name || "another person") + " (" + collision.email + ") in FindMi, " +
+      "not to the VP. VP identity is resolved by email instead.");
+  }
+  return {
+    ids,
+    name:  (primary && primary.name)  || CFG.vp.name,
+    email: (primary && primary.email) || cfgEmail,
+    fromDirectory: !!primary,
+    collision
+  };
+}
+
+/* Every id the VP may act under (config ids + whatever FindMi resolved). */
+function vpIdentityIds() {
+  const ids = (RUNTIME.vpIds && RUNTIME.vpIds.length)
+    ? RUNTIME.vpIds : [CFG.vp.id, CFG.vp.directoryId];
+  return Array.from(new Set(ids.filter(Boolean)));
+}
+function isVpIdentity(id) { return !!id && vpIdentityIds().includes(id); }
+// The id new VP steps are embedded under: the configured id, unless FindMi
+// showed it belongs to someone else, in which case his Support Staff id.
+function vpStepId() { return RUNTIME.vpStepId || CFG.vp.id; }
+function vpDisplayName() { return RUNTIME.vpName || CFG.vp.name; }
+function makeVpStep() {
+  return {
+    role: "VP", label: "VP of Ops",
+    userIds: [vpStepId()], userId: vpStepId(), name: vpDisplayName(),
+    note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
+  };
+}
+// A step is "the VP's" when any of its approvers is one of his identities.
+function stepIsVp(step) {
+  return !!step && (step.userIds || [step.userId]).some(isVpIdentity);
+}
 
 /* ============================================================
    2. APPROVAL CHAINS — one INDEPENDENT chain per store.
@@ -304,12 +408,22 @@ function rateReviewerIds(kind) {
   return { ids, name: r.name };
 }
 
+/* HOUSE RULE — the VP and the threshold.
+   Sam (the VP) signs ONLY when the invoice total is at or above the live VP
+   threshold. Under it he is never on a chain — not as the VP step, not as a
+   stand-in, not as a fallback when a store is missing its DM or DO. A short
+   chain (DM only, or DO only) is a complete chain: whoever FindMi still lists
+   for the store approves it and that is enough. */
+function vpRequired(amount) { return (Number(amount) || 0) >= getVpThreshold(); }
+
 // Steps for ONE store. DM -> (rate check) -> DO -> VP when the total demands.
 function buildStoreChainSteps(store, amount, users, vendorRule) {
   const steps = [];
   const nameOf = id => (users[id] && users[id].name) || "Unknown";
+  // Under the VP threshold the VP is not an approver under ANY identity.
+  const allowed = id => users[id] && (vpRequired(amount) || !isVpIdentity(id));
 
-  const acIds = effectiveAcIds(store).filter(id => users[id]);
+  const acIds = effectiveAcIds(store).filter(allowed);
   if (acIds.length) {
     steps.push({
       role: "AREA_COACH", label: "District Manager (DM)",
@@ -331,7 +445,7 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
   }
 
   const effDirId = effectiveDirectorId(store);
-  if (effDirId && users[effDirId]) {
+  if (effDirId && allowed(effDirId)) {
     // Per-Director threshold: skip the DO on small invoices — but ONLY when
     // a DM is on the chain. A Director who is the only approver always stays.
     const doMin = directorThresholdFor(effDirId);
@@ -347,19 +461,11 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
     }
   }
 
-  if (amount >= getVpThreshold()) {
-    // Sam is also the assigned DIRECTOR for C-Store/car wash stores under a
-    // different id; skip the duplicate VP step in THIS chain when he already
-    // appears in it.
-    const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
-    const already = steps.some(s => s.userIds.some(id => vpIds.includes(id)));
-    if (!already) {
-      steps.push({
-        role: "VP", label: "VP of Ops",
-        userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
-      });
-    }
+  if (vpRequired(amount)) {
+    // Skip the duplicate VP step when he already appears in THIS chain under
+    // any of his identities (e.g. picked as a stand-in), so the same person
+    // isn't asked to sign twice.
+    if (!steps.some(stepIsVp)) steps.push(makeVpStep());
   }
   return steps;
 }
@@ -420,7 +526,13 @@ function getChains(inv) {
 function identityIdsFor(user) {
   if (!user || !user.id) return [];
   const ids = [user.id];
+  // Sessions that carry several directory ids (the VP: Support Staff record
+  // + the id VP steps embed under + any other FindMi record with his email).
+  (user.ids || []).forEach(id => { if (id && !ids.includes(id)) ids.push(id); });
   const email = (user.email || "").toLowerCase();
+  if (email && (RUNTIME.vpEmail || "").toLowerCase() === email) {
+    vpIdentityIds().forEach(id => { if (!ids.includes(id)) ids.push(id); });
+  }
   // the rate-reviewer alias for this same human, and vice versa
   Object.values(CFG.rateReviewers || {}).forEach(r => {
     if (!r) return;
@@ -467,11 +579,17 @@ function deriveStatus(chains) {
    - Rate Verification and VP steps are config, not directory —
      untouched (except VP dedupe below).
    - If the store no longer has a DM (or DO), that step is dropped
-     and the chain waits on the next stage instead.
+     and the chain waits on the next stage instead. A chain missing
+     its DM or DO does NOT fall through to the VP: he joins only
+     when the total is at/above the live VP threshold, same as any
+     other chain. Under it, whoever is left (DM alone is enough)
+     approves; if nobody is left and nobody has signed, the invoice
+     is reported for a stand-in rather than routed to the VP or
+     silently approved.
    - If the person the chain is CURRENTLY waiting on changed, the
      SLA clock restarts — the new approver gets a fresh window.
-   - If a new Director IS the VP, a later VP step is dropped so
-     the same person isn't asked twice.
+   - If the VP already signs the chain under another identity, the
+     VP step is dropped so the same person isn't asked twice.
    - Stores missing from the directory are skipped and reported.
    ============================================================ */
 function repairChainAgainstDirectory(chain, store, users, now, amount) {
@@ -485,19 +603,26 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   const changes = [];
   let clockReset = false;
   const label = chain.storeName || store.name || "store";
+  const amtNum = Number(amount) || 0;
+  const needVp = vpRequired(amtNum);
+  const thr = "$" + getVpThreshold().toLocaleString();
+  // Under the VP threshold the VP is not an approver under ANY identity —
+  // not as DM, not as DO, not as a Settings stand-in.
+  const allowed = id => users[id] && (needVp || !isVpIdentity(id));
 
   // New Director id up-front, for the VP-dedupe rule. Effective = the
   // directory's Director, or the Settings stand-in for a store missing one.
   const effDir = effectiveDirectorId(store);
-  const newDirId = effDir && users[effDir] ? effDir : null;
-  const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
+  const newDirId = effDir && allowed(effDir) ? effDir : null;
+  const dirIsVpUnderThreshold = !!effDir && users[effDir] && !needVp && isVpIdentity(effDir);
+  const effAcs = effectiveAcIds(store).filter(allowed);
 
   const newSteps = [];
   (chain.steps || []).forEach((step, idx) => {
     if (idx < curIdx) { newSteps.push(step); return; }   // history
 
     if (step.role === "AREA_COACH") {
-      const ids = effectiveAcIds(store).filter(id => users[id]);
+      const ids = effAcs;
       if (!ids.length) {
         changes.push(label + ": District Manager step removed — no DM on this store now");
         return;                                          // dropped
@@ -514,14 +639,25 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
 
     if (step.role === "DIRECTOR") {
       if (!newDirId) {
-        changes.push(label + ": Director step removed — no Director on this store now");
+        let why = ": Director step removed — no Director on this store now";
+        if (dirIsVpUnderThreshold) {
+          why = ": Director step removed — " + nameOf(effDir) + " is the VP and $" +
+            amtNum.toLocaleString() + " is under the " + thr + " VP threshold";
+        } else if (stepIsVp(step) || isVpIdentity(store.staleDirectorId)) {
+          why = ": Director step removed — it was routed to " + vpDisplayName() +
+            " through a deleted FindMi Director record; he is the VP, not a Director, and joins only at " +
+            thr + "+";
+        } else if (store.staleDirectorId) {
+          why = ": Director step removed — FindMi's Director for this store no longer exists";
+        }
+        changes.push(label + why);
         return;
       }
       const doMin = directorThresholdFor(newDirId);
       const hasDM = (chain.steps || []).some(st => st.role === "AREA_COACH");
-      if (doMin > 0 && (amount || 0) < doMin && hasDM) {
+      if (doMin > 0 && amtNum < doMin && hasDM) {
         changes.push(label + ": Director step removed — $" +
-          (Number(amount) || 0).toLocaleString() + " is under " + nameOf(newDirId) +
+          amtNum.toLocaleString() + " is under " + nameOf(newDirId) +
           "'s $" + doMin.toLocaleString() + " threshold");
         return;
       }
@@ -533,21 +669,30 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
       return;
     }
 
-    if (step.role === "VP" && newDirId && vpIds.includes(newDirId)) {
-      changes.push(label + ": VP step removed — the new Director is the VP");
+    if (step.role === "VP") {
+      // Open VP steps are re-derived below from the threshold; drop the old one.
       return;
     }
 
-    newSteps.push(step);                                 // RATE_REVIEW, VP
+    // Any other OPEN step (rate review, hand-picked office approver) that is
+    // secretly the VP under one of his identities is not allowed under the
+    // threshold either.
+    if (!needVp && stepIsVp(step)) {
+      changes.push(label + ": \"" + (step.label || step.role) + "\" step removed — " +
+        (step.name || "the VP") + " is the VP and $" + amtNum.toLocaleString() +
+        " is under the " + thr + " VP threshold");
+      return;
+    }
+
+    newSteps.push(step);                                 // RATE_REVIEW, OFFICE_n
   });
 
   // ---- Threshold reconciliation on the rebuilt open portion ----
   const passedSlice = (chain.steps || []).slice(0, curIdx);
-  const amtNum = Number(amount) || 0;
+  const hadOpenVp = (chain.steps || []).some((st, i) => i >= curIdx && st.role === "VP");
 
   // DM missing but now available (directory hire or Settings stand-in), and
   // the chain hasn't passed where the DM would sit (its first stage):
-  const effAcs = effectiveAcIds(store).filter(id => users[id]);
   let dmPrepended = false;
   if (effAcs.length &&
       !(chain.steps || []).some(st => st.role === "AREA_COACH") &&
@@ -573,9 +718,7 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
       role: "DIRECTOR", label: "Director of Ops",
       userIds: [newDirId], userId: newDirId, name: nameOf(newDirId)
     };
-    // Slot before an open VP step; otherwise at the end.
-    const vpIdx = newSteps.findIndex(st => st.role === "VP" && !passedSlice.includes(st));
-    if (vpIdx >= 0) newSteps.splice(vpIdx, 0, dirStep); else newSteps.push(dirStep);
+    newSteps.push(dirStep);
     changes.push(label + ": Director step added — " + nameOf(newDirId) +
       " now covers this store" +
       (directorThresholdFor(newDirId) > 0
@@ -583,28 +726,28 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
           directorThresholdFor(newDirId).toLocaleString() + " threshold" : ""));
   }
 
-  // VP required by the current threshold but absent (and Sam isn't already
-  // in the chain under either identity):
-  if (amtNum >= getVpThreshold() &&
-      !newSteps.some(st => st.role === "VP") &&
-      !newSteps.some(st => (st.userIds || []).some(id => vpIds.includes(id)))) {
-    newSteps.push({
-      role: "VP", label: "VP of Ops",
-      userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-      note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
-    });
-    changes.push(label + ": VP step added — $" + amtNum.toLocaleString() +
-      " is at or above the $" + getVpThreshold().toLocaleString() + " VP threshold");
-  }
-
-  // VP no longer required: drop an OPEN VP step (a signed one is history).
-  if (amtNum < getVpThreshold()) {
-    const vpOpenIdx = newSteps.findIndex(st => st.role === "VP" && !passedSlice.includes(st));
-    if (vpOpenIdx >= 0) {
-      newSteps.splice(vpOpenIdx, 1);
-      changes.push(label + ": VP step removed — $" + amtNum.toLocaleString() +
-        " is under the $" + getVpThreshold().toLocaleString() + " VP threshold");
+  // VP step: present exactly when the total is at/above the live threshold and
+  // he isn't already in the open portion under another identity. Always last.
+  if (needVp) {
+    if (!newSteps.some(st => !passedSlice.includes(st) && stepIsVp(st))) {
+      const vpStep = makeVpStep();
+      newSteps.push(vpStep);
+      if (!hadOpenVp) {
+        changes.push(label + ": VP step added — $" + amtNum.toLocaleString() +
+          " is at or above the " + thr + " VP threshold");
+      } else {
+        // Re-derived the same open VP step: keep the ORIGINAL object so this
+        // is not a change and does not restart his clock.
+        const orig = (chain.steps || []).find((st, i) => i >= curIdx && st.role === "VP");
+        newSteps[newSteps.length - 1] = orig;
+      }
+    } else if (hadOpenVp) {
+      changes.push(label + ": VP step removed — " + vpDisplayName() +
+        " already signs this chain under another step");
     }
+  } else if (hadOpenVp) {
+    changes.push(label + ": VP step removed — $" + amtNum.toLocaleString() +
+      " is under the " + thr + " VP threshold");
   }
 
   if (!changes.length) return null;
@@ -614,26 +757,24 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   const passed = (chain.steps || []).slice(0, curIdx);
   let firstOpen = newSteps.find(st => !passed.includes(st));
 
-  // Every remaining approver was removed from the directory. The rule:
-  //   under the live VP threshold -> collected signatures stand; completes.
-  //   at/above it -> Sam (VP) must sign; route to him if he hasn't already.
+  // Nobody is left to sign. Under the threshold the VP is NOT the fallback:
+  //   - at least one approval already collected -> those signatures stand and
+  //     the chain completes (the DM's sign-off is enough);
+  //   - nothing collected at all -> nobody has looked at this invoice, so it
+  //     is NOT auto-approved; it is reported for a stand-in DM/DO in Settings.
+  // At/above the threshold the VP step was appended above, so this branch
+  // only fires under it.
   if (!firstOpen) {
-    if ((amount || 0) >= getVpThreshold()) {
-      const vpStep = {
-        role: "VP", label: "VP of Ops",
-        userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
-      };
-      newSteps.push(vpStep);
-      firstOpen = vpStep;
-      changes.push(label + ": no DM or Director remains — routed to " +
-        CFG.vp.name + " (VP) because the invoice total is $" +
-        getVpThreshold().toLocaleString() + "+");
-    } else {
-      changes.push(label + ": no approvers remain and the total is under $" +
-        getVpThreshold().toLocaleString() + " — completed with the signatures already collected");
+    const signed = (chain.history || []).some(h => h.action === "APPROVE");
+    if (signed) {
+      changes.push(label + ": no approvers remain and the total is under " + thr +
+        " — completed with the signatures already collected");
       return { changes, autoApprove: true, newSteps };
     }
+    return { skipped: "no District Manager or Director is left to approve it and " +
+      "nobody has signed yet; the total ($" + amtNum.toLocaleString() + ") is under the " +
+      thr + " VP threshold so it is not routed to " + vpDisplayName() +
+      " — assign a stand-in in Settings → Incomplete approval paths" };
   }
 
   let newStage = newSteps.some(st => st.role === chain.currentStage)
@@ -671,7 +812,7 @@ function approverIdResolves(id, users) {
   if (users[id]) return true;
   if (String(id).indexOf("rate:") === 0) return true;      // config identities
   if (String(id).indexOf("admin:") === 0) return true;
-  if (id === CFG.vp.id || id === CFG.vp.directoryId) return true;
+  if (isVpIdentity(id)) return true;
   return false;
 }
 
@@ -733,7 +874,7 @@ const OFFICE_STORE_ID = "dpm-office";
 
 /* DPM Office chains are hand-picked: Finance chooses the approvers, in
    order, and each becomes a sequential step. The house VP rule still holds —
-   the live VP threshold appends Sam unless he's already chosen. */
+   the live VP threshold appends the VP unless he's already chosen. */
 function officeApproverOptions(users) {
   const opts = [];
   Object.values(users || {}).forEach(u => {
@@ -760,16 +901,8 @@ function buildOfficeChain(approverKeys, amount, users, now) {
     userIds: o.ids, userId: o.ids[0], name: o.name
   }));
 
-  if (amount >= getVpThreshold()) {
-    const vpIds = [CFG.vp.id, CFG.vp.directoryId].filter(Boolean);
-    const already = steps.some(st => st.userIds.some(id => vpIds.includes(id)));
-    if (!already) {
-      steps.push({
-        role: "VP", label: "VP of Ops",
-        userIds: [CFG.vp.id], userId: CFG.vp.id, name: CFG.vp.name,
-        note: "Invoice total $" + getVpThreshold().toLocaleString() + "+"
-      });
-    }
+  if (vpRequired(amount)) {
+    if (!steps.some(stepIsVp)) steps.push(makeVpStep());
   }
 
   return {
@@ -792,7 +925,15 @@ function canActOnChain(user, chain) {
   if (chain.status !== "PENDING") return false;
   const step = chainCurrentStep(chain);
   if (!step) return false;
-  return (step.userIds || [step.userId]).includes(user.id);
+  const mine = identityIdsFor(user);
+  return (step.userIds || [step.userId]).some(id => mine.includes(id));
+}
+
+// True when the user is named on ANY step of the invoice, under any identity.
+function userNamedOn(user, inv) {
+  const mine = identityIdsFor(user);
+  return getChains(inv).some(c =>
+    (c.steps || []).some(s => (s.userIds || [s.userId]).some(id => mine.includes(id))));
 }
 
 // True when the user can act on at least one chain of the invoice.
@@ -828,6 +969,20 @@ function resolveSession(email, pw, dir) {
     if (pw !== P.admin) return { error: "That password doesn't match this role." };
     return { id: CFG.rateReviewers.RAHIM.id, email: lc,
              name: CFG.rateReviewers.RAHIM.name, role: "RATE_REVIEWER", scope: "self" };
+  }
+
+  // 1c. VP of Ops. His email is whatever FindMi has on his Support Staff
+  //     record (dir.vp, resolved at load); the VP password proves the role.
+  //     The session id is the id VP steps are embedded under, and `ids`
+  //     carries every other FindMi id that is his, so he can act on a step
+  //     filed under any of them. If he also holds another role's password
+  //     (e.g. he is listed as a DM), that branch below still works.
+  const vpInfo = (dir && dir.vp) || { ids: vpIdentityIds(), name: CFG.vp.name,
+                                       email: (CFG.vp.email || "").toLowerCase() };
+  const isVpEmail = !!vpInfo.email && lc === vpInfo.email;
+  if (isVpEmail && pw === P.vp) {
+    return { id: vpStepId(), ids: vpInfo.ids.slice(), email: lc,
+             name: vpInfo.name, role: "VP", scope: "vp" };
   }
 
   // 2. Finance / AP. Directory first so that once these people are added
@@ -868,6 +1023,7 @@ function resolveSession(email, pw, dir) {
              role: "MANAGER", scope: "single", storeId: store.id };
   }
 
+  if (isVpEmail) return { error: "That password doesn't match the VP role." };
   return { error: "We couldn't find that email in the directory. Check it's the email on file." };
 }
 
@@ -883,6 +1039,11 @@ function buildImpersonatedSession(u, dir) {
   }
   const person = dir.users[u.id];
   if (!person) return null;
+  if (person.role === "VP" || isVpIdentity(person.id)) {
+    const vpInfo = dir.vp || { ids: vpIdentityIds(), name: person.name, email: person.email };
+    return { id: vpStepId(), ids: vpInfo.ids.slice(), email: (vpInfo.email || "").toLowerCase(),
+             name: vpInfo.name || person.name, role: "VP", scope: "vp", _sim: true };
+  }
   return { id: person.id, email: (person.email || "").toLowerCase(),
            name: person.name, role: person.role,
            scope: person.role === "DIRECTOR" ? "director" : "stores", _sim: true };
@@ -2111,7 +2272,7 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
               <p className="text-sm font-medium text-slate-800">DPM Office approvers</p>
               <p className="mt-0.5 text-xs text-slate-500">
                 They sign in the order listed{amt >= getVpThreshold()
-                  ? "; " + CFG.vp.name + " is added automatically at $" +
+                  ? "; " + vpDisplayName() + " is added automatically at $" +
                     getVpThreshold().toLocaleString() + "+" : ""}.
               </p>
               {officeApprovers.length > 0 && (
@@ -2878,8 +3039,9 @@ function IncompletePathsPanel({ stores, users, pathOverrides, currentUser }) {
         and who stands in for the gap. Stored in the database — the single
         source of truth for routing. FindMi always wins once it has someone:
         fix the directory and the stand-in retires itself. "Proceed without"
-        keeps today's short-chain behavior
-        ({CFG.vp.name} still joins at the VP threshold either way).
+        keeps the short chain: whoever is left approves, and that is enough.
+        {vpDisplayName()} never fills a gap — he joins only at the VP threshold,
+        like on any other invoice.
       </p>
 
       {incomplete.length === 0 ? (
@@ -2984,8 +3146,8 @@ function ThresholdsPanel({ users, thresholds, currentUser }) {
 
       <div className="mt-4 flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2">
         <div>
-          <p className="text-sm font-medium text-slate-800">{CFG.vp.name} — VP of Ops</p>
-          <p className="text-xs text-slate-500">Required at or above this amount</p>
+          <p className="text-sm font-medium text-slate-800">{vpDisplayName()} — VP of Ops</p>
+          <p className="text-xs text-slate-500">Required at or above this amount; never an approver below it</p>
         </div>
         <div className="flex items-center gap-1">
           <span className="text-sm text-slate-500">$</span>
@@ -3293,7 +3455,7 @@ function SettingsPanel({ invoices, stores, users, vendorRules, thresholds, pathO
           </div>
           <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2">
             <dt className="text-slate-500">VP</dt>
-            <dd className="text-slate-700">{CFG.vp.name}</dd>
+            <dd className="text-slate-700">{vpDisplayName()}{RUNTIME.vpEmail ? " · " + RUNTIME.vpEmail : ""}</dd>
           </div>
         </dl>
       </div>
@@ -3412,7 +3574,8 @@ function App() {
   // number of hooks on every render, so a useMemo placed after the loading/login
   // returns would run only once a session exists and crash with error #310.
   const isAdmin   = !!session && session.role === "ADMIN";
-  const isApprover = !!session && (session.role === "AREA_COACH" || session.role === "DIRECTOR");
+  const isApprover = !!session && (session.role === "AREA_COACH" || session.role === "DIRECTOR" ||
+                                   session.role === "VP");
 
   // Approver hub: their stores as tiles with pending-on-them counts — the same
   // pattern as the repair app. Tiles are the union of their ASSIGNED stores
@@ -3424,7 +3587,7 @@ function App() {
     const cmts = {};                       // storeId -> unread comments
     let cmtTotal = 0;
     invoices.forEach(i => {
-      const unread = unreadCommentsFor(session.id, i);
+      const unread = unreadCommentsFor(identityIdsFor(session), i);
       const seen = new Set();
       getChains(i).forEach(c => {
         if (canActOnChain(session, c)) counts[c.storeId] = (counts[c.storeId] || 0) + 1;
@@ -3437,8 +3600,9 @@ function App() {
       cmtTotal += unread;
     });
     Object.keys(cmts).forEach(id => { counts[id] = counts[id] || 0; }); // ensure tile exists
+    const myIds = identityIdsFor(session);
     const assigned = dir.stores.filter(st =>
-      (st.acIds || []).includes(session.id) || st.directorId === session.id);
+      (st.acIds || []).some(id => myIds.includes(id)) || myIds.includes(st.directorId));
     const byId = {};
     assigned.forEach(st => { byId[st.id] = { id: st.id, name: st.name,
       storeNumber: st.storeNumber, entity: st.entity, division: st.division,
@@ -3466,7 +3630,7 @@ function App() {
     if (!session) return [];
     if (canSeeAll) return invoices;
     return invoices.filter(i =>
-      getChains(i).some(c => (c.steps || []).some(s => (s.userIds || []).includes(session.id))) ||
+      userNamedOn(session, i) ||
       i.createdBy === session.id ||
       (session.storeId && (i.storeId === session.storeId ||
         (i.storeIds || []).includes(session.storeId))));
