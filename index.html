@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.2",
+  version: "4.3",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -925,6 +925,27 @@ function chainCurrentStep(chain) {
    WAITING  — a pending chain sits at their step right now
    APPROVED — they approved at least one chain
    REJECTED — they rejected at least one chain */
+/* Everything a person might remember about an invoice, searchable: vendor,
+   number, amount, every store name/number, every approver who is or was on
+   it, whoever filed and paid it, and the conversation (comments and
+   approval/rejection notes written after this feature shipped — older
+   comments predate the searchable copy). */
+function invoiceSearchHaystack(inv) {
+  const parts = [inv.vendor, inv.invoiceNumber, inv.storeName, inv.division,
+    inv.entity, inv.createdByName, inv.paidByName, String(inv.amount || "")];
+  getChains(inv).forEach(c => {
+    parts.push(c.storeName, c.storeNumber, c.division, c.entity);
+    (c.steps || []).forEach(st => { parts.push(st.name, st.label); });
+    (c.history || []).forEach(h => { if (h) parts.push(h.byName); });
+  });
+  (inv.commentLog || []).forEach(e => { if (e && e.text) parts.push(e.text); });
+  return parts.filter(Boolean).join(" § ").toLowerCase();
+}
+function invoiceMatchesQuery(inv, q) {
+  if (!q) return true;
+  return invoiceSearchHaystack(inv).includes(String(q).toLowerCase());
+}
+
 function invoiceApproverRelation(inv, approverId, rel) {
   // Expand a bare dropdown id to every identity that same human signs under:
   // the VP's full alias set, and rate-reviewer <-> admin id pairs.
@@ -1596,7 +1617,8 @@ const commentService = {
     });
     // Denormalize onto the invoice doc so notification counts are computable
     // from a single document read (the repair app reads these over REST).
-    const log = [...((inv && inv.commentLog) || []), { ts, by: author.id }];
+    const log = [...((inv && inv.commentLog) || []),
+      { ts, by: author.id, text: String(text).trim().slice(0, 500) }];
     await invoiceService.update(invoiceId, { commentLog: log, lastCommentAt: ts });
   },
 
@@ -1972,7 +1994,7 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
 
         <div className="w-px h-4 bg-[#e0dbd3]" />
         <input value={filters.q} onChange={e => set("q", e.target.value)}
-               placeholder="Search vendor or invoice #…"
+               placeholder="Search vendor, store, approver, comments…"
                className={sel + " flex-1 min-w-[160px]"} />
 
         {active && (
@@ -2992,7 +3014,12 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
             )}
           </div>
           <p className="mt-1 truncate text-sm text-slate-500">
-            {chains.length} store{chains.length > 1 ? "s" : ""}
+            {(() => {
+              const names = chains.map(c => c.storeName || "(store)").filter(Boolean);
+              const shown = names.length <= 2 ? names.join(", ")
+                : names.slice(0, 2).join(", ") + " +" + (names.length - 2) + " more";
+              return <span title={names.join(", ")}>{shown}</span>;
+            })()}
             {inv.invoiceNumber ? " · #" + inv.invoiceNumber : ""}
             {inv.createdByName ? " · by " + inv.createdByName : ""}
           </p>
@@ -3082,9 +3109,14 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
       {canFinance && inv.status === "APPROVED" && resolved && approved > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3">
           <p className="text-sm text-emerald-800">
-            {approved === chains.length
-              ? "All " + chains.length + " store" + (chains.length > 1 ? "s" : "") + " approved."
-              : approved + " of " + chains.length + " stores approved — pay the approved stores only."}
+            {(() => {
+              const ok = chains.filter(c => c.status === "APPROVED").map(c => c.storeName || "(store)");
+              const list = ok.length <= 3 ? ok.join(", ")
+                : ok.slice(0, 3).join(", ") + " +" + (ok.length - 3) + " more";
+              return approved === chains.length
+                ? (chains.length === 1 ? list + " approved." : "All " + chains.length + " stores approved: " + list + ".")
+                : approved + " of " + chains.length + " approved — pay " + list + " only.";
+            })()}
           </p>
           <button onClick={() => onMarkPaid(inv)}
             className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
@@ -3993,9 +4025,7 @@ function App() {
       if (filters.month && paidMonthKey(i) !== filters.month) return false;
       if (filters.vendor &&
           (i.vendor || "").trim().toLowerCase() !== filters.vendor) return false;
-      if (q && !((i.vendor || "").toLowerCase().includes(q) ||
-                 (i.invoiceNumber || "").toLowerCase().includes(q) ||
-                 (i.storeName || "").toLowerCase().includes(q))) return false;
+      if (q && !invoiceMatchesQuery(i, q)) return false;
       return true;
     });
   }, [visible, filters, canSeeAll]);
