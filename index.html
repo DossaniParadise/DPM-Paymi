@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.4",
+  version: "4.5",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -1711,6 +1711,68 @@ function fmtAmt(n) {
 
 // Stat cards + filter bar. Finance and admin only — an area coach has a handful
 // of invoices and doesn't need a filter rig over them.
+/* Who may see the Paid summary, and how wide:
+     Finance/Admin — already have it on the dashboard (all stores).
+     VP + Rahim    — everything, all stores.
+     Directors     — ONLY invoices touching their own stores.
+   DMs don't get the screen. */
+function paidScopeFor(session, invoices, stores) {
+  if (!session) return null;
+  if (session.role === "VP" || session.role === "RATE_REVIEWER")
+    return { invs: invoices, stores };
+  if (session.role === "DIRECTOR") {
+    const mine = stores.filter(st => effectiveDirectorId(st) === session.id);
+    const ids = new Set(mine.map(st => st.id));
+    return {
+      invs: invoices.filter(i => getChains(i).some(c => ids.has(c.storeId))),
+      stores: mine
+    };
+  }
+  return null;
+}
+
+function PaidScreen({ invoices, stores, session, onBack }) {
+  const [f, setF] = useState({ status: "PAID", month: "", vendor: "", vendor_display: "", store: "" });
+  const scope = paidScopeFor(session, invoices, stores);
+  if (!scope) return null;
+  const rows = scope.invs.filter(i => {
+    if (i.status !== "PAID") return false;
+    if (f.month && paidMonthKey(i) !== f.month) return false;
+    if (f.vendor && (i.vendor || "").trim().toLowerCase() !== f.vendor) return false;
+    if (f.store && !getChains(i).some(c => c.storeId === f.store)) return false;
+    return true;
+  });
+  return (
+    <div>
+      <div className="mb-3 flex items-center justify-between">
+        <button onClick={onBack}
+          className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50">
+          ‹ Back
+        </button>
+        {session.role === "DIRECTOR" && (
+          <span className="text-xs text-slate-500">
+            Your stores only ({scope.stores.length})
+          </span>
+        )}
+      </div>
+      <PaidSummary invoices={scope.invs} stores={scope.stores}
+                   filters={f} setFilters={setF} />
+      <div className="mt-3 space-y-3">
+        {rows.length === 0 && (
+          <p className="rounded-xl border border-dashed bg-white p-8 text-center text-sm text-slate-500">
+            No paid invoices match.
+          </p>
+        )}
+        {rows.map(inv => (
+          <InvoiceRow key={inv.id} inv={inv} users={{}} currentUser={session}
+                      now={Date.now()} onAct={() => {}} onMarkPaid={() => {}} onDelete={() => {}}
+                      canFinance={false} compact />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PaidBar({ label, total, max, pct, on, onClick, sub }) {
   const w = max ? Math.max(2, Math.round(total / max * 100)) : 0;
   const Tag = onClick ? "button" : "div";
@@ -4197,11 +4259,22 @@ function App() {
       {/* Approvers (DM / DO / VP) get a store-tile hub like the repair app;
           Finance/admin keep the tabbed dashboard. */}
       {(!canSeeAll || financeScreen === "dashboard") && (isApprover ? (
-        approverScreen === "hub" ? (
+        approverScreen === "paid" &&
+        (session.role === "VP" || session.role === "DIRECTOR") ? (
+          <PaidScreen invoices={invoices} stores={dir.stores} session={session}
+                      onBack={() => setApproverScreen("hub")} />
+        ) : approverScreen === "hub" ? (
           <div>
             <div className="mb-3 flex items-baseline justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+              <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-500">
                 Your stores
+                {(session.role === "VP" || session.role === "DIRECTOR") && (
+                  <button onClick={() => setApproverScreen("paid")}
+                    className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1
+                               text-[11px] font-semibold normal-case tracking-normal text-emerald-800 hover:bg-emerald-100">
+                    💵 Paid summary
+                  </button>
+                )}
               </h2>
               <span className="text-right text-sm text-slate-500">
                 <span className="block">
@@ -4308,7 +4381,8 @@ function App() {
           : [["inbox",   "Needs me (" + mine.length + ")"],
              ...(unreadTotal ? [["unread", "💬 Comments (" + unreadTotal + ")"]] : []),
              ["pending", "All pending (" + pending.length + ")"],
-             ["done",    "Closed (" + done.length + ")"]]
+             ["done",    "Closed (" + done.length + ")"],
+             ...(session.role === "RATE_REVIEWER" ? [["paid", "💵 Paid"]] : [])]
         ).map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)}
             className={"flex-1 rounded-md px-3 py-1.5 font-medium " +
@@ -4322,6 +4396,9 @@ function App() {
         <SettingsPanel invoices={invoices} stores={dir.stores} users={dir.users}
                        vendorRules={vendorRules} thresholds={thresholds}
                        pathOverrides={pathOverrides} currentUser={session} />
+      ) : tab === "paid" && session.role === "RATE_REVIEWER" ? (
+        <PaidScreen invoices={invoices} stores={dir.stores} session={session}
+                    onBack={() => setTab("inbox")} />
       ) : (
       <div className="space-y-3">
         {tab === "unread" && shown.length > 0 && (
