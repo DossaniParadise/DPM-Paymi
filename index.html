@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.1",
+  version: "4.2",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -920,6 +920,36 @@ function chainCurrentStep(chain) {
   return (chain.steps || []).find(s => s.role === chain.currentStage) || null;
 }
 
+/* How an approver relates to an invoice, alias-aware:
+   ANY      — appears on any step or has signed anything (past or present)
+   WAITING  — a pending chain sits at their step right now
+   APPROVED — they approved at least one chain
+   REJECTED — they rejected at least one chain */
+function invoiceApproverRelation(inv, approverId, rel) {
+  // Expand a bare dropdown id to every identity that same human signs under:
+  // the VP's full alias set, and rate-reviewer <-> admin id pairs.
+  const mine = isVpIdentity(approverId) ? vpIdentityIds().slice() : [approverId];
+  Object.values(CFG.rateReviewers || {}).forEach(r => {
+    if (!r) return;
+    const adminId = "admin:" + (r.email || "").toLowerCase();
+    if (approverId === r.id || approverId === adminId) {
+      if (!mine.includes(r.id)) mine.push(r.id);
+      if (!mine.includes(adminId)) mine.push(adminId);
+    }
+  });
+  const chains = getChains(inv);
+  const inHistory = act => chains.some(c =>
+    (c.history || []).some(h => h && h.action === act && mine.includes(h.by)));
+  if (rel === "APPROVED") return inHistory("APPROVE");
+  if (rel === "REJECTED") return inHistory("REJECT");
+  if (rel === "WAITING")
+    return chains.some(c => canActOnChain({ id: approverId, ids: mine }, c));
+  // ANY: on any step of any chain, or anywhere in the signing history.
+  return chains.some(c =>
+    (c.steps || []).some(st => (st.userIds || []).some(id => mine.includes(id)))) ||
+    inHistory("APPROVE") || inHistory("REJECT");
+}
+
 function canActOnChain(user, chain) {
   if (!user || !chain) return false;
   if (chain.status !== "PENDING") return false;
@@ -1681,13 +1711,22 @@ function PaidBar({ label, total, max, pct, on, onClick, sub }) {
   );
 }
 
-function PaidSummary({ invoices, stores }) {
-  const [sel, setSel] = useState({ month: "", vendor: "", store: "" });
+function PaidSummary({ invoices, stores, filters, setFilters }) {
+  // Selections live in the SAME filter state as the invoice list, so picking
+  // a month/vendor/store here narrows the rows underneath to match.
+  const sel = { month: filters.month || "", vendor: filters.vendor_display || "",
+                store: filters.store || "" };
+  const setSel = next => setFilters(f => ({ ...f,
+    month: next.month || "",
+    vendor: (next.vendor || "").trim().toLowerCase(),
+    vendor_display: next.vendor || "",
+    store: next.store || "" }));
+  const [more, setMore] = useState({ vendors: false, stores: false });
   const ins = useMemo(() => buildPaidInsights(invoices, {
     month: sel.month || null,
     vendor: sel.vendor ? sel.vendor.toLowerCase() : null,
     store: sel.store || null
-  }), [invoices, sel]);
+  }), [invoices, sel.month, sel.vendor, sel.store]);
 
   const TOP = 8;
   const bucket = (list, key) => {
@@ -1716,15 +1755,7 @@ function PaidSummary({ invoices, stores }) {
 
   return (
     <div className="rounded-xl border border-emerald-200 bg-white p-5 shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-slate-900">💵 Paid — where the money went</h2>
-        {anySel && (
-          <button onClick={() => setSel({ month: "", vendor: "", store: "" })}
-            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs text-slate-600 hover:bg-slate-50">
-            ✕ Clear filters
-          </button>
-        )}
-      </div>
+      <h2 className="text-sm font-semibold text-slate-900">💵 Paid — where the money went</h2>
 
       <div className="mt-3 flex flex-wrap gap-2">
         <select value={sel.month} onChange={e => setSel({ ...sel, month: e.target.value })}
@@ -1743,6 +1774,14 @@ function PaidSummary({ invoices, stores }) {
           {ins.stores.map(st => <option key={st.id || st.name} value={st.id}>{st.name}</option>)}
         </select>
       </div>
+
+      {anySel && (
+        <button onClick={() => setSel({ month: "", vendor: "", store: "" })}
+          className="mt-3 w-full rounded-xl border-2 border-red-300 bg-red-50 px-6 py-3
+                     text-sm font-bold uppercase tracking-wide text-red-700 hover:bg-red-100 sm:w-auto">
+          ✕ Clear all filters — show everything
+        </button>
+      )}
 
       <div className="mt-4 flex items-baseline gap-3 rounded-xl bg-slate-50 px-4 py-3">
         <span className="text-3xl font-bold tracking-tight text-emerald-700">
@@ -1783,18 +1822,36 @@ function PaidSummary({ invoices, stores }) {
           ))}
 
       <Section title="By vendor" />
-      {vend.top.map(v => (
+      {(more.vendors ? ins.vendors : vend.top).map(v => (
         <PaidBar key={v.name} label={v.name} total={v.total} max={maxV}
           on={sel.vendor === v.name} onClick={() => toggle("vendor", v.name)} />
       ))}
-      {vend.other && <PaidBar label={vend.other.label} total={vend.other.total} max={maxV} />}
+      {vend.other && !more.vendors && (
+        <PaidBar label={vend.other.label + " — tap to open"} total={vend.other.total} max={maxV}
+          onClick={() => setMore(m => ({ ...m, vendors: true }))} />
+      )}
+      {more.vendors && ins.vendors.length > TOP && (
+        <button onClick={() => setMore(m => ({ ...m, vendors: false }))}
+          className="mt-1 text-xs font-medium text-slate-500 underline hover:text-slate-700">
+          Show top {TOP} only
+        </button>
+      )}
 
       <Section title="By store" />
-      {stor.top.map(st => (
+      {(more.stores ? ins.stores : stor.top).map(st => (
         <PaidBar key={st.id || st.name} label={st.name} total={st.total} max={maxS}
           on={sel.store === st.id} onClick={() => toggle("store", st.id)} />
       ))}
-      {stor.other && <PaidBar label={stor.other.label} total={stor.other.total} max={maxS} />}
+      {stor.other && !more.stores && (
+        <PaidBar label={stor.other.label + " — tap to open"} total={stor.other.total} max={maxS}
+          onClick={() => setMore(m => ({ ...m, stores: true }))} />
+      )}
+      {more.stores && ins.stores.length > TOP && (
+        <button onClick={() => setMore(m => ({ ...m, stores: false }))}
+          className="mt-1 text-xs font-medium text-slate-500 underline hover:text-slate-700">
+          Show top {TOP} only
+        </button>
+      )}
 
       <p className="mt-3 text-xs text-slate-400">
         Tap a bar to focus it; each chart keeps showing its full breakdown under
@@ -1833,7 +1890,7 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
       const next = { ...f, [k]: v };
       // The month/vendor drill-downs belong to the Paid view; leaving it
       // shouldn't keep filtering the other lists invisibly.
-      if (k === "status" && v !== "PAID") { next.month = ""; next.vendor = ""; }
+      if (k === "status" && v !== "PAID") { next.month = ""; next.vendor = ""; next.vendor_display = ""; }
       return next;
     });
     // Tapping a status card should land the person ON that list, not leave
@@ -1890,13 +1947,28 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
         </FilterGroup>
 
         <div className="w-px h-4 bg-[#e0dbd3]" />
-        <FilterGroup label="Waiting on">
-          <select value={filters.approver} onChange={e => set("approver", e.target.value)}
+        <FilterGroup label="Approver">
+          <select value={filters.approver}
+                  onChange={e => setFilters(f => ({ ...f, approver: e.target.value, approverRel: "ANY" }))}
                   className={sel + " max-w-[150px]"}>
             <option value="">Anyone</option>
             {approvers.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
         </FilterGroup>
+        {filters.approver && (
+          <div className="flex items-center gap-1">
+            {[["ANY", "All theirs"], ["WAITING", "Waiting on them"],
+              ["APPROVED", "Approved by them"], ["REJECTED", "Rejected by them"]].map(([v, lbl]) => (
+              <button key={v} type="button" onClick={() => set("approverRel", v)}
+                className={"rounded-full border px-2.5 py-1 text-xs font-medium " +
+                  ((filters.approverRel || "ANY") === v
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-slate-300 bg-white text-slate-600 hover:bg-slate-100")}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="w-px h-4 bg-[#e0dbd3]" />
         <input value={filters.q} onChange={e => set("q", e.target.value)}
@@ -3754,6 +3826,7 @@ function App() {
     { vpThreshold: RUNTIME.vpThreshold, directorThresholds: {} });
   const [pathOverrides, setPathOverrides] = useState({});
   const [filters, setFilters]   = useState({ status: "", division: "", store: "", approver: "", q: "",
+                                             approverRel: "ANY",
                                              month: "", vendor: "" });   // month+vendor: Paid-view insights
   // Invoices carrying comments this person hasn't read. The audience is wider
   // than the approval queue — you stay in it after approving — so these can sit
@@ -3914,8 +3987,9 @@ function App() {
       if (filters.division && i.division !== filters.division) return false;
       if (filters.store && i.storeId !== filters.store &&
           !(i.storeIds || []).includes(filters.store)) return false;
-      if (filters.approver && !getChains(i).some(c =>
-            canActOnChain({ id: filters.approver }, c))) return false;
+      if (filters.approver &&
+          !invoiceApproverRelation(i, filters.approver, filters.approverRel || "ANY"))
+        return false;
       if (filters.month && paidMonthKey(i) !== filters.month) return false;
       if (filters.vendor &&
           (i.vendor || "").trim().toLowerCase() !== filters.vendor) return false;
@@ -4199,7 +4273,8 @@ function App() {
           </p>
         )}
         {tab === "all" && filters.status === "PAID" && (
-          <PaidSummary invoices={invoices} stores={dir.stores} />
+          <PaidSummary invoices={invoices} stores={dir.stores}
+                       filters={filters} setFilters={setFilters} />
         )}
         {shown.length === 0 && (
           <p className="rounded-xl border border-dashed bg-white p-8 text-center text-sm text-slate-500">
