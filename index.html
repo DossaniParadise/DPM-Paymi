@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.3",
+  version: "4.4",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -1744,6 +1744,7 @@ function PaidSummary({ invoices, stores, filters, setFilters }) {
     vendor_display: next.vendor || "",
     store: next.store || "" }));
   const [more, setMore] = useState({ vendors: false, stores: false });
+  const [mini, setMini] = useState(false);
   const ins = useMemo(() => buildPaidInsights(invoices, {
     month: sel.month || null,
     vendor: sel.vendor ? sel.vendor.toLowerCase() : null,
@@ -1797,13 +1798,20 @@ function PaidSummary({ invoices, stores, filters, setFilters }) {
         </select>
       </div>
 
-      {anySel && (
-        <button onClick={() => setSel({ month: "", vendor: "", store: "" })}
-          className="mt-3 w-full rounded-xl border-2 border-red-300 bg-red-50 px-6 py-3
-                     text-sm font-bold uppercase tracking-wide text-red-700 hover:bg-red-100 sm:w-auto">
-          ✕ Clear all filters — show everything
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {anySel && (
+          <button onClick={() => setSel({ month: "", vendor: "", store: "" })}
+            className="w-full rounded-xl border-2 border-red-300 bg-red-50 px-6 py-3
+                       text-sm font-bold uppercase tracking-wide text-red-700 hover:bg-red-100 sm:w-auto">
+            ✕ Clear all filters — show everything
+          </button>
+        )}
+        <button onClick={() => { setMini(m => !m); setMore({ vendors: false, stores: false }); }}
+          className="rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-medium
+                     text-slate-600 hover:bg-slate-50">
+          {mini ? "▼ Show charts" : "▲ Minimize charts"}
         </button>
-      )}
+      </div>
 
       <div className="mt-4 flex items-baseline gap-3 rounded-xl bg-slate-50 px-4 py-3">
         <span className="text-3xl font-bold tracking-tight text-emerald-700">
@@ -1835,6 +1843,7 @@ function PaidSummary({ invoices, stores, filters, setFilters }) {
         </p>
       )}
 
+      {!mini && (<>
       <Section title="By month" />
       {ins.months.length === 0
         ? <p className="text-sm text-slate-400">No paid invoices yet.</p>
@@ -1881,6 +1890,7 @@ function PaidSummary({ invoices, stores, filters, setFilters }) {
         across the stores that approved. Months use the date Finance pressed
         Mark Paid.
       </p>
+      </>)}
     </div>
   );
 }
@@ -1898,10 +1908,28 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
 
   // Only approvers who actually appear on an invoice, so the list stays short.
   const approvers = useMemo(() => {
+    // One entry per HUMAN: Sam's several directory-era ids collapse to one,
+    // and a rate reviewer's rate:/admin: pair collapses to one. Selecting the
+    // canonical id still matches every alias (the relation filter expands).
+    const canon = id => {
+      if (isVpIdentity(id)) return vpStepId();
+      for (const r of Object.values(CFG.rateReviewers || {})) {
+        if (!r) continue;
+        if (id === r.id || id === "admin:" + (r.email || "").toLowerCase()) return r.id;
+      }
+      return id;
+    };
+    const nameFor = (raw, s) => {
+      if (isVpIdentity(raw)) return CFG.vp.name;
+      for (const r of Object.values(CFG.rateReviewers || {}))
+        if (r && (raw === r.id || raw === "admin:" + (r.email || "").toLowerCase())) return r.name;
+      return (users[raw] && users[raw].name) || s.name || raw;
+    };
     const seen = new Map();
     invoices.forEach(i => getChains(i).forEach(c => (c.steps || []).forEach(s => {
-      (s.userIds || []).forEach(id => {
-        if (!seen.has(id)) seen.set(id, (users[id] && users[id].name) || s.name || id);
+      (s.userIds || []).forEach(raw => {
+        const id = canon(raw);
+        if (!seen.has(id)) seen.set(id, nameFor(raw, s));
       });
     })));
     return [...seen.entries()].sort((a, b) => a[1].localeCompare(b[1]));
