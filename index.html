@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.0",
+  version: "4.1",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -1265,6 +1265,74 @@ function effectiveChainStatus(inv, chain) {
 
 /* One row per PENDING chain that has blown its window — a snapshot of who
    is sitting on what, right now. Sorted most-overdue first. */
+/* ============================================================
+   PAID INSIGHTS — "how much did we pay this vendor in April?"
+   Month bucket: the date Finance pressed Mark Paid; older records
+   without paidAt fall back to their last update / creation.
+   Store attribution: an invoice's amount is split EVENLY across
+   its approved chains, so multi-store invoices don't double-count
+   (a $900 invoice paid across 3 stores adds $300 to each).
+   Each chart ignores its own filter (so you can always switch
+   month/vendor/store) but respects the other two.
+   ============================================================ */
+function paidMonthKey(inv) {
+  const t = inv.paidAt || inv.updatedAt || inv.createdAt;
+  if (!t) return "";
+  const d = new Date(t);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+}
+function monthLabel(key) {
+  const [y, m] = key.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "numeric" });
+}
+
+function buildPaidInsights(invoices, sel) {
+  sel = sel || {};
+  const vendorKey = v => (v || "").trim().toLowerCase();
+  const paid = invoices.filter(i => i.status === "PAID");
+  const matchMonth  = i => !sel.month  || paidMonthKey(i) === sel.month;
+  const matchVendor = i => !sel.vendor || vendorKey(i.vendor) === sel.vendor;
+  const matchStore  = i => !sel.store  ||
+    getChains(i).some(c => c.storeId === sel.store);
+
+  const months = {};                       // respects vendor+store, not month
+  paid.filter(i => matchVendor(i) && matchStore(i)).forEach(i => {
+    const k = paidMonthKey(i);
+    if (k) months[k] = (months[k] || 0) + (Number(i.amount) || 0);
+  });
+
+  const vendors = {};                      // respects month+store, not vendor
+  paid.filter(i => matchMonth(i) && matchStore(i)).forEach(i => {
+    const k = (i.vendor || "").trim() || "(no vendor)";
+    vendors[k] = (vendors[k] || 0) + (Number(i.amount) || 0);
+  });
+
+  const stores = {};                       // respects month+vendor, not store
+  paid.filter(i => matchMonth(i) && matchVendor(i)).forEach(i => {
+    const ch = getChains(i);
+    const approvedChains = ch.filter(c => c.status === "APPROVED");
+    const share = approvedChains.length
+      ? (Number(i.amount) || 0) / approvedChains.length : 0;
+    (approvedChains.length ? approvedChains : ch).forEach(c => {
+      const key = c.storeId || c.storeName || "?";
+      if (!stores[key]) stores[key] = { id: c.storeId, name: c.storeName || "(store)", total: 0 };
+      stores[key].total += approvedChains.length ? share
+        : (Number(i.amount) || 0) / (ch.length || 1);
+    });
+  });
+
+  const inSel = paid.filter(i => matchMonth(i) && matchVendor(i) && matchStore(i));
+  return {
+    months: Object.entries(months).sort((a, b) => a[0] < b[0] ? -1 : 1)
+      .map(([key, total]) => ({ key, label: monthLabel(key), total })),
+    vendors: Object.entries(vendors).map(([name, total]) => ({ name, total }))
+      .sort((a, b) => b.total - a.total),
+    stores: Object.values(stores).sort((a, b) => b.total - a.total),
+    grand: { total: inSel.reduce((n, i) => n + (Number(i.amount) || 0), 0),
+             count: inSel.length }
+  };
+}
+
 function buildOverdueRows(invoices, now) {
   const rows = [];
   invoices.forEach(inv => {
@@ -1591,6 +1659,153 @@ function fmtAmt(n) {
 
 // Stat cards + filter bar. Finance and admin only — an area coach has a handful
 // of invoices and doesn't need a filter rig over them.
+function PaidBar({ label, total, max, pct, on, onClick, sub }) {
+  const w = max ? Math.max(2, Math.round(total / max * 100)) : 0;
+  const Tag = onClick ? "button" : "div";
+  return (
+    <Tag onClick={onClick}
+      className={"flex w-full items-center gap-2 rounded-lg px-1 py-0.5 text-left " +
+        (onClick ? "cursor-pointer hover:bg-amber-50 " : "") +
+        (on ? "bg-amber-50 ring-1 ring-amber-300" : "")}>
+      <div className="w-32 shrink-0 truncate text-xs text-slate-700 sm:w-40">{label}
+        {sub && <span className="text-slate-400"> {sub}</span>}</div>
+      <div className="h-5 flex-1 overflow-hidden rounded-md border border-slate-200 bg-slate-100">
+        <div className="h-full rounded-[5px] bg-gradient-to-r from-amber-400 to-amber-600 transition-all"
+             style={{ width: w + "%" }} />
+      </div>
+      <div className="w-24 shrink-0 text-right text-xs font-semibold tabular-nums text-slate-800">
+        ${total.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        {pct != null && <span className="font-normal text-slate-400"> · {pct}%</span>}
+      </div>
+    </Tag>
+  );
+}
+
+function PaidSummary({ invoices, stores }) {
+  const [sel, setSel] = useState({ month: "", vendor: "", store: "" });
+  const ins = useMemo(() => buildPaidInsights(invoices, {
+    month: sel.month || null,
+    vendor: sel.vendor ? sel.vendor.toLowerCase() : null,
+    store: sel.store || null
+  }), [invoices, sel]);
+
+  const TOP = 8;
+  const bucket = (list, key) => {
+    if (list.length <= TOP + 1) return { top: list, other: null };
+    const top = list.slice(0, TOP);
+    const rest = list.slice(TOP);
+    return { top, other: { label: "Other (" + rest.length + " " + key + ")",
+                           total: rest.reduce((n, x) => n + x.total, 0) } };
+  };
+  const vend = bucket(ins.vendors, "vendors");
+  const stor = bucket(ins.stores, "stores");
+  const maxM = Math.max(0, ...ins.months.map(x => x.total));
+  const maxV = Math.max(0, ...ins.vendors.map(x => x.total));
+  const maxS = Math.max(0, ...ins.stores.map(x => x.total));
+  const toggle = (k, v) => setSel({ ...sel, [k]: sel[k] === v ? "" : v });
+  const anySel = sel.month || sel.vendor || sel.store;
+  const storeName = id => (stores.find(st => st.id === id) || {}).name ||
+    (ins.stores.find(x => x.id === id) || {}).name || id;
+
+  const Section = ({ title }) => (
+    <div className="mt-4 mb-1.5 flex items-center gap-2">
+      <span className="text-xs font-bold uppercase tracking-widest text-slate-400">{title}</span>
+      <span className="h-px flex-1 bg-slate-200" />
+    </div>
+  );
+
+  return (
+    <div className="rounded-xl border border-emerald-200 bg-white p-5 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-slate-900">💵 Paid — where the money went</h2>
+        {anySel && (
+          <button onClick={() => setSel({ month: "", vendor: "", store: "" })}
+            className="rounded-full border border-slate-300 px-2.5 py-1 text-xs text-slate-600 hover:bg-slate-50">
+            ✕ Clear filters
+          </button>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <select value={sel.month} onChange={e => setSel({ ...sel, month: e.target.value })}
+          className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium">
+          <option value="">All months</option>
+          {ins.months.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
+        </select>
+        <select value={sel.vendor} onChange={e => setSel({ ...sel, vendor: e.target.value })}
+          className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium">
+          <option value="">All vendors</option>
+          {ins.vendors.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
+        </select>
+        <select value={sel.store} onChange={e => setSel({ ...sel, store: e.target.value })}
+          className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium">
+          <option value="">All stores</option>
+          {ins.stores.map(st => <option key={st.id || st.name} value={st.id}>{st.name}</option>)}
+        </select>
+      </div>
+
+      <div className="mt-4 flex items-baseline gap-3 rounded-xl bg-slate-50 px-4 py-3">
+        <span className="text-3xl font-bold tracking-tight text-emerald-700">
+          ${ins.grand.total.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+        </span>
+        <span className="text-sm text-slate-500">
+          {ins.grand.count} invoice{ins.grand.count === 1 ? "" : "s"} paid
+          {sel.vendor ? " · " + sel.vendor : ""}
+          {sel.month ? " · " + monthLabel(sel.month) : ""}
+          {sel.store ? " · " + storeName(sel.store) : ""}
+        </span>
+      </div>
+
+      {sel.vendor && sel.month && ins.grand.count > 0 && (
+        <p className="mt-2 text-sm text-slate-700">
+          You paid <span className="font-semibold">{sel.vendor}</span>{" "}
+          <span className="font-semibold text-emerald-700">
+            ${ins.grand.total.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+          </span>{" "}
+          in {monthLabel(sel.month)}
+          {sel.store ? <> at <span className="font-semibold">{storeName(sel.store)}</span></> : null}
+          {" "}across {ins.grand.count} invoice{ins.grand.count === 1 ? "" : "s"}.
+        </p>
+      )}
+
+      {ins.grand.count === 0 && (
+        <p className="mt-3 rounded-lg border border-dashed bg-white p-5 text-center text-sm text-slate-500">
+          Nothing paid matches this combination.
+        </p>
+      )}
+
+      <Section title="By month" />
+      {ins.months.length === 0
+        ? <p className="text-sm text-slate-400">No paid invoices yet.</p>
+        : ins.months.map(m => (
+            <PaidBar key={m.key} label={m.label} total={m.total} max={maxM}
+              on={sel.month === m.key} onClick={() => toggle("month", m.key)} />
+          ))}
+
+      <Section title="By vendor" />
+      {vend.top.map(v => (
+        <PaidBar key={v.name} label={v.name} total={v.total} max={maxV}
+          on={sel.vendor === v.name} onClick={() => toggle("vendor", v.name)} />
+      ))}
+      {vend.other && <PaidBar label={vend.other.label} total={vend.other.total} max={maxV} />}
+
+      <Section title="By store" />
+      {stor.top.map(st => (
+        <PaidBar key={st.id || st.name} label={st.name} total={st.total} max={maxS}
+          on={sel.store === st.id} onClick={() => toggle("store", st.id)} />
+      ))}
+      {stor.other && <PaidBar label={stor.other.label} total={stor.other.total} max={maxS} />}
+
+      <p className="mt-3 text-xs text-slate-400">
+        Tap a bar to focus it; each chart keeps showing its full breakdown under
+        the other two filters. Multi-store invoices split their amount evenly
+        across the stores that approved. Months use the date Finance pressed
+        Mark Paid.
+      </p>
+    </div>
+  );
+}
+
 function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStatusNav }) {
   const stats = useMemo(() => {
     const counts = { PENDING: 0, APPROVED: 0, REJECTED: 0, PAID: 0 };
@@ -1614,7 +1829,13 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
   }, [invoices, users]);
 
   const set = (k, v) => {
-    setFilters(f => ({ ...f, [k]: v }));
+    setFilters(f => {
+      const next = { ...f, [k]: v };
+      // The month/vendor drill-downs belong to the Paid view; leaving it
+      // shouldn't keep filtering the other lists invisibly.
+      if (k === "status" && v !== "PAID") { next.month = ""; next.vendor = ""; }
+      return next;
+    });
     // Tapping a status card should land the person ON that list, not leave
     // them wherever they were.
     if (k === "status" && onStatusNav) onStatusNav();
@@ -3532,7 +3753,8 @@ function App() {
   const [thresholds, setThresholds] = useState(
     { vpThreshold: RUNTIME.vpThreshold, directorThresholds: {} });
   const [pathOverrides, setPathOverrides] = useState({});
-  const [filters, setFilters]   = useState({ status: "", division: "", store: "", approver: "", q: "" });
+  const [filters, setFilters]   = useState({ status: "", division: "", store: "", approver: "", q: "",
+                                             month: "", vendor: "" });   // month+vendor: Paid-view insights
   // Invoices carrying comments this person hasn't read. The audience is wider
   // than the approval queue — you stay in it after approving — so these can sit
   // on invoices that are nowhere near the "Needs me" tab. That's exactly why
@@ -3694,6 +3916,9 @@ function App() {
           !(i.storeIds || []).includes(filters.store)) return false;
       if (filters.approver && !getChains(i).some(c =>
             canActOnChain({ id: filters.approver }, c))) return false;
+      if (filters.month && paidMonthKey(i) !== filters.month) return false;
+      if (filters.vendor &&
+          (i.vendor || "").trim().toLowerCase() !== filters.vendor) return false;
       if (q && !((i.vendor || "").toLowerCase().includes(q) ||
                  (i.invoiceNumber || "").toLowerCase().includes(q) ||
                  (i.storeName || "").toLowerCase().includes(q))) return false;
@@ -3972,6 +4197,9 @@ function App() {
             Invoices with comments you haven't read. Each is open below — reading the
             conversation marks it read, and it drops off this list.
           </p>
+        )}
+        {tab === "all" && filters.status === "PAID" && (
+          <PaidSummary invoices={invoices} stores={dir.stores} />
         )}
         {shown.length === 0 && (
           <p className="rounded-xl border border-dashed bg-white p-8 text-center text-sm text-slate-500">
