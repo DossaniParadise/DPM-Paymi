@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "3.9",
+  version: "4.0",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -2628,6 +2628,36 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
   const rejected = chains.filter(c => c.status === "REJECTED").length;
   const resolved = chains.every(c => c.status === "APPROVED" || c.status === "REJECTED");
 
+  // At-a-glance names, no Details click needed: who each pending chain is
+  // waiting on, and who rejected. Store suffix only when it disambiguates.
+  const glance = useMemo(() => {
+    const nameFor = (h, c) => {
+      if (h && h.byName) return h.byName;
+      if (h && users[h.by]) return users[h.by].name;
+      const st = h && (c.steps || []).find(x => x.role === h.stage);
+      return st ? st.name : "";
+    };
+    const addTo = (map, name, c) => {
+      if (!name) return;
+      if (!map.has(name)) map.set(name, []);
+      if (chains.length > 1 && c.storeName) map.get(name).push(c.storeName);
+    };
+    const wait = new Map(), rej = new Map();
+    chains.forEach(c => {
+      if (c.status === "PENDING") {
+        const step = chainCurrentStep(c);
+        if (step) addTo(wait, step.name, c);
+      } else if (c.status === "REJECTED") {
+        const h = [...(c.history || [])].reverse().find(x => x && x.action === "REJECT");
+        addTo(rej, nameFor(h, c), c);
+      }
+    });
+    const fmt = m => [...m.entries()]
+      .map(([n, sts]) => n + (sts.length ? " (" + sts.join(", ") + ")" : ""))
+      .join(", ");
+    return { waiting: fmt(wait), rejectedBy: fmt(rej) };
+  }, [inv, chains, users]);
+
   // Most urgent SLA across pending chains for the card-level pill.
   const worst = chains
     .filter(c => c.status === "PENDING")
@@ -2673,6 +2703,23 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
             {inv.invoiceNumber ? " · #" + inv.invoiceNumber : ""}
             {inv.createdByName ? " · by " + inv.createdByName : ""}
           </p>
+          {(glance.waiting || glance.rejectedBy) && (
+            <p className="mt-0.5 text-sm">
+              {glance.waiting && (
+                <>
+                  <span className="text-slate-500">Waiting on: </span>
+                  <span className="font-semibold text-amber-700">{glance.waiting}</span>
+                </>
+              )}
+              {glance.waiting && glance.rejectedBy && <span className="text-slate-300"> · </span>}
+              {glance.rejectedBy && (
+                <>
+                  <span className="text-slate-500">Rejected by: </span>
+                  <span className="font-semibold text-red-700">{glance.rejectedBy}</span>
+                </>
+              )}
+            </p>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
