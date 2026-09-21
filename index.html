@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.6",
+  version: "4.7",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -3221,30 +3221,28 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
       {/* Finance processes payment once every chain has resolved. Pays the
           approved subset — "3 of 4" is a normal outcome, not an error. */}
       {inv.status === "REJECTED" && (
-        <div className={"mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border-2 p-3 " +
-          (rejectionTagOf(inv) === "OPEN"
-            ? "border-green-300 bg-green-50" : "border-red-300 bg-red-100")}>
-          <span className={"text-base font-extrabold uppercase tracking-wide " +
-            (rejectionTagOf(inv) === "OPEN" ? "text-green-700" : "text-red-700")}>
-            {rejectionTagOf(inv) === "OPEN" ? "● Rejection OPEN — being resolved" : "■ Rejection CLOSED"}
-          </span>
+        <div className={"mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg p-3 " +
+          (rejectionTagOf(inv) === "OPEN" ? "bg-green-50" : "bg-red-50")}>
+          <p className={"text-sm font-semibold " +
+            (rejectionTagOf(inv) === "OPEN" ? "text-green-800" : "text-red-800")}>
+            {rejectionTagOf(inv) === "OPEN"
+              ? "● New invoice still pending" : "● New invoice already received"}
+          </p>
           {canFinance && onTagRejection && (
             <div className="flex gap-2">
               <button onClick={() => onTagRejection(inv, "OPEN")}
-                disabled={rejectionTagOf(inv) === "OPEN"}
-                className={"rounded-lg px-4 py-2 text-sm font-bold " +
+                className={"rounded-lg px-4 py-2 text-sm font-medium " +
                   (rejectionTagOf(inv) === "OPEN"
-                    ? "cursor-default bg-green-600 text-white"
-                    : "border-2 border-green-500 bg-white text-green-700 hover:bg-green-50")}>
-                Mark OPEN
+                    ? "bg-green-600 text-white"
+                    : "border border-green-600 bg-white text-green-700 hover:bg-green-50")}>
+                Still pending
               </button>
               <button onClick={() => onTagRejection(inv, "CLOSED")}
-                disabled={rejectionTagOf(inv) === "CLOSED"}
-                className={"rounded-lg px-4 py-2 text-sm font-bold " +
+                className={"rounded-lg px-4 py-2 text-sm font-medium " +
                   (rejectionTagOf(inv) === "CLOSED"
-                    ? "cursor-default bg-red-600 text-white"
-                    : "border-2 border-red-500 bg-white text-red-700 hover:bg-red-50")}>
-                Mark CLOSED
+                    ? "bg-red-600 text-white"
+                    : "border border-red-600 bg-white text-red-700 hover:bg-red-50")}>
+                Received
               </button>
             </div>
           )}
