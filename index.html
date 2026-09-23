@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.7",
+  version: "4.8",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -3231,18 +3231,20 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
           {canFinance && onTagRejection && (
             <div className="flex gap-2">
               <button onClick={() => onTagRejection(inv, "OPEN")}
+                title="This is for rejections where we still haven't received the new replacement invoice"
                 className={"rounded-lg px-4 py-2 text-sm font-medium " +
                   (rejectionTagOf(inv) === "OPEN"
                     ? "bg-green-600 text-white"
                     : "border border-green-600 bg-white text-green-700 hover:bg-green-50")}>
-                Still pending
+                Open
               </button>
               <button onClick={() => onTagRejection(inv, "CLOSED")}
+                title="This is for rejections where we have received the adjusted or corrected invoice"
                 className={"rounded-lg px-4 py-2 text-sm font-medium " +
                   (rejectionTagOf(inv) === "CLOSED"
                     ? "bg-red-600 text-white"
                     : "border border-red-600 bg-white text-red-700 hover:bg-red-50")}>
-                Received
+                Closed
               </button>
             </div>
           )}
