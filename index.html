@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "4.9",
+  version: "5.0",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -3027,7 +3027,8 @@ function ChainCard({ inv, chain, chainIdx, currentUser, now, onAct, canFinance, 
         </ul>
       )}
 
-      {isAdmin && onAddApprover && chain.status === "PENDING" && !chain._legacy && (
+      {isAdmin && onAddApprover && !chain._legacy && inv.status !== "PAID" &&
+       ["PENDING", "REJECTED", "APPROVED"].includes(chain.status) && (
         <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-violet-200 bg-violet-50 p-2">
           <span className="text-xs font-semibold text-violet-800">➕ Add approver:</span>
           <select value={addSel} onChange={e => setAddSel(e.target.value)}
@@ -3042,7 +3043,7 @@ function ChainCard({ inv, chain, chainIdx, currentUser, now, onAct, canFinance, 
             className={"rounded-lg px-3 py-1.5 text-xs font-semibold " +
               (addSel ? "bg-violet-600 text-white hover:bg-violet-700"
                       : "cursor-not-allowed bg-slate-200 text-slate-400")}>
-            Add — goes to them now
+            {chain.status === "PENDING" ? "Add — goes to them now" : "Add — re-opens & goes to them"}
           </button>
         </div>
       )}
@@ -4584,30 +4585,49 @@ function App() {
     if (session.role !== "ADMIN") { setErr("Only an admin can add approvers."); return; }
     const person = officeApproverOptions(dir.users).find(o => o.key === personKey);
     if (!person) { setErr("Pick who should approve."); return; }
+    if (inv.status === "PAID") { setErr("Paid invoices are final — approvers can't be added."); return; }
     const chains = getChains(inv).map(c => ({ ...c, steps: [...(c.steps || [])],
                                               history: [...(c.history || [])] }));
     const chain = chains[chainIdx];
-    if (!chain || chain._legacy || chain.status !== "PENDING") return;
-    if ((chain.steps || []).some(st => st.role === chain.currentStage &&
+    if (!chain || chain._legacy) return;
+    if (!["PENDING", "REJECTED", "APPROVED"].includes(chain.status)) return;
+    if (chain.status === "PENDING" &&
+        (chain.steps || []).some(st => st.role === chain.currentStage &&
         (st.userIds || []).join() === person.ids.join())) {
       setErr(person.name + " is already the current approver here."); return;
     }
     const ts = Date.now();
-    const curIdx = chain.steps.findIndex(st => st.role === chain.currentStage);
-    if (curIdx < 0) return;
+    const wasResolved = chain.status !== "PENDING";
     const newStep = { role: "ADDED_" + ts, label: "Added approver",
                       userIds: person.ids.slice(), userId: person.ids[0],
                       name: person.name, note: "Added by " + session.name };
-    chain.steps.splice(curIdx, 0, newStep);
+    if (chain.status === "APPROVED") {
+      // Fully signed: the new person signs LAST — nobody re-signs, and their
+      // approval completes the chain again.
+      chain.steps.push(newStep);
+    } else {
+      // Pending or rejected: they become the CURRENT step; whoever was at
+      // this stage (including a rejecter, who gets a second look) resumes
+      // right after them.
+      const curIdx = chain.steps.findIndex(st => st.role === chain.currentStage);
+      chain.steps.splice(curIdx < 0 ? chain.steps.length : curIdx, 0, newStep);
+    }
+    chain.status = "PENDING";
     chain.currentStage = newStep.role;
     chain.stageEnteredAt = ts;
     chain.history.push({ stage: newStep.role, by: session.id, byName: session.name,
-                         action: "ADDED", note: "Added " + person.name + " as approver", ts });
-    await invoiceService.update(inv.id, { chains, updatedAt: ts });
+                         action: "ADDED", note: "Added " + person.name + " as approver" +
+                         (wasResolved ? " (re-opened this store's approval)" : ""), ts });
+    const patch = { chains, status: deriveStatus(chains), updatedAt: ts };
+    // A re-opened invoice isn't a rejection anymore; a FUTURE rejection
+    // should start with a fresh OPEN tag, not inherit a stale one.
+    if (inv.status === "REJECTED") patch.rejectedTag = "";
+    await invoiceService.update(inv.id, patch);
     try {
       await commentService.add(inv.id, session,
         "Added " + person.name + " as an approver on " + (chain.storeName || "this store") +
-        " — the invoice is now waiting on them.", inv);
+        (wasResolved ? " — this store's approval was re-opened and is now waiting on them."
+                     : " — the invoice is now waiting on them."), inv);
     } catch (e) { /* the step is saved; a failed announcement is non-fatal */ }
   }
 
