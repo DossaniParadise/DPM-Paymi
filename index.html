@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "5.0",
+  version: "5.1",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -2948,7 +2948,9 @@ function CommentThread({ invoiceId, inv, currentUser, canPost }) {
 function ChainCard({ inv, chain, chainIdx, currentUser, now, onAct, canFinance, users, onAddApprover }) {
   const [note, setNote] = useState("");
   const [addSel, setAddSel] = useState("");
-  const isAdmin = currentUser && currentUser.role === "ADMIN" && !currentUser._sim;
+  // Finance and admin may both pull people onto an approval.
+  const isAdmin = currentUser && !currentUser._sim &&
+    (currentUser.role === "ADMIN" || currentUser.role === "FINANCE");
   const addOpts = useMemo(
     () => (isAdmin && onAddApprover ? officeApproverOptions(users || {}) : []),
     [users, isAdmin, onAddApprover]);
@@ -4582,7 +4584,9 @@ function App() {
      so everyone on the invoice knows why it moved. */
   async function addApprover(inv, chainIdx, personKey) {
     if (session._sim) { setErr("You're viewing as someone else. Return to your account to act."); return; }
-    if (session.role !== "ADMIN") { setErr("Only an admin can add approvers."); return; }
+    if (session.role !== "ADMIN" && session.role !== "FINANCE") {
+      setErr("Only finance or an admin can add approvers."); return;
+    }
     const person = officeApproverOptions(dir.users).find(o => o.key === personKey);
     if (!person) { setErr("Pick who should approve."); return; }
     if (inv.status === "PAID") { setErr("Paid invoices are final — approvers can't be added."); return; }
