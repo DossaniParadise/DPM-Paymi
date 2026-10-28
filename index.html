@@ -45,7 +45,7 @@
 <script>
 window.APP_CONFIG = {
   // Shown in the footer for all users. Increment on every update.
-  version: "5.1",
+  version: "5.2",
   // Firestore
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -417,7 +417,13 @@ function rateReviewerIds(kind) {
 function vpRequired(amount) { return (Number(amount) || 0) >= getVpThreshold(); }
 
 // Steps for ONE store. DM -> (rate check) -> DO -> VP when the total demands.
-function buildStoreChainSteps(store, amount, users, vendorRule) {
+/* amount      = the INVOICE TOTAL — decides the VP (house rule, always).
+   storeAmount = this store's share of a combo invoice — decides the
+                 Director's per-store threshold. Defaults to the total for
+                 single-store invoices and older records. */
+function buildStoreChainSteps(store, amount, users, vendorRule, storeAmount) {
+  const share = (storeAmount != null && isFinite(Number(storeAmount)))
+    ? Number(storeAmount) : (Number(amount) || 0);
   const steps = [];
   const nameOf = id => (users[id] && users[id].name) || "Unknown";
   // Under the VP threshold the VP is not an approver under ANY identity.
@@ -449,7 +455,7 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
     // Per-Director threshold: skip the DO on small invoices — but ONLY when
     // a DM is on the chain. A Director who is the only approver always stays.
     const doMin = directorThresholdFor(effDirId);
-    const skipDO = doMin > 0 && amount < doMin && acIds.length > 0;
+    const skipDO = doMin > 0 && share < doMin && acIds.length > 0;
     if (!skipDO) {
       const dirStep = {
         role: "DIRECTOR", label: "Director of Ops",
@@ -471,12 +477,19 @@ function buildStoreChainSteps(store, amount, users, vendorRule) {
 }
 
 // Full chain objects for an invoice.
-function buildChains(stores, amount, users, now, vendorRule) {
+/* allocations: { storeId: amount } for combo invoices. Missing/empty = the
+   whole amount belongs to each store (single-store invoices), stored as the
+   chain's amount so every reader has one source of truth. */
+function buildChains(stores, amount, users, now, vendorRule, allocations) {
+  const alloc = allocations || {};
   return stores.map(st => {
-    const steps = buildStoreChainSteps(st, amount, users, vendorRule);
+    const share = alloc[st.id] != null ? Number(alloc[st.id])
+      : (stores.length > 1 ? null : Number(amount) || 0);
+    const steps = buildStoreChainSteps(st, amount, users, vendorRule, share);
     return {
       storeId: st.id,
       storeName: st.name,
+      amount: share,
       storeNumber: st.storeNumber || "",
       entity: st.entity || "",
       division: st.division || "",
@@ -487,6 +500,23 @@ function buildChains(stores, amount, users, now, vendorRule) {
       history: []
     };
   });
+}
+
+/* A chain's share of the invoice. Combo invoices filed after v5.2 carry it
+   on the chain; older multi-store records fall back to an even split; a
+   single-store invoice is the whole amount. */
+function chainAmount(inv, chain) {
+  if (chain && chain.amount != null && isFinite(Number(chain.amount))) return Number(chain.amount);
+  const n = getChains(inv).length || 1;
+  return (Number(inv.amount) || 0) / n;
+}
+function chainHasOwnAmount(chain) {
+  return !!chain && chain.amount != null && isFinite(Number(chain.amount));
+}
+/* Dollars Finance should actually pay: the approved chains' shares. */
+function payableAmount(inv) {
+  return getChains(inv).filter(c => c.status === "APPROVED")
+    .reduce((n, c) => n + chainAmount(inv, c), 0);
 }
 
 // Normalized chains for ANY invoice. Legacy single-chain invoices (top-level
@@ -603,7 +633,8 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   const changes = [];
   let clockReset = false;
   const label = chain.storeName || store.name || "store";
-  const amtNum = Number(amount) || 0;
+  const amtNum = Number(amount) || 0;                       // invoice total → VP
+  const shareNum = chainHasOwnAmount(chain) ? Number(chain.amount) : amtNum;  // store share → DO
   const needVp = vpRequired(amtNum);
   const thr = "$" + getVpThreshold().toLocaleString();
   // Under the VP threshold the VP is not an approver under ANY identity —
@@ -655,9 +686,9 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
       }
       const doMin = directorThresholdFor(newDirId);
       const hasDM = (chain.steps || []).some(st => st.role === "AREA_COACH");
-      if (doMin > 0 && amtNum < doMin && hasDM) {
-        changes.push(label + ": Director step removed — $" +
-          amtNum.toLocaleString() + " is under " + nameOf(newDirId) +
+      if (doMin > 0 && shareNum < doMin && hasDM) {
+        changes.push(label + ": Director step removed — this store's $" +
+          shareNum.toLocaleString() + " is under " + nameOf(newDirId) +
           "'s $" + doMin.toLocaleString() + " threshold");
         return;
       }
@@ -713,7 +744,7 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
   if (newDirId &&
       !(chain.steps || []).some(st => st.role === "DIRECTOR") &&
       !newSteps.some(st => st.role === "DIRECTOR") &&
-      amtNum >= directorThresholdFor(newDirId)) {
+      shareNum >= directorThresholdFor(newDirId)) {
     const dirStep = {
       role: "DIRECTOR", label: "Director of Ops",
       userIds: [newDirId], userId: newDirId, name: nameOf(newDirId)
@@ -723,7 +754,8 @@ function repairChainAgainstDirectory(chain, store, users, now, amount) {
       " now covers this store" +
       (directorThresholdFor(newDirId) > 0
         ? " and $" + amtNum.toLocaleString() + " meets their $" +
-          directorThresholdFor(newDirId).toLocaleString() + " threshold" : ""));
+          directorThresholdFor(newDirId).toLocaleString() + " threshold" : "")
+      .replace("$" + amtNum.toLocaleString() + " meets", "this store's $" + shareNum.toLocaleString() + " meets"));
   }
 
   // VP step: present exactly when the total is at/above the live threshold and
@@ -1180,7 +1212,12 @@ function applyThresholdConfig(doc) {
   RUNTIME.vpThreshold = (doc && Number(doc.vpThreshold) > 0)
     ? Number(doc.vpThreshold) : CFG.vpThreshold;
   RUNTIME.directorThresholds = (doc && doc.directorThresholds) || {};
+  // Combo invoices where some stores reject:
+  //   "PARTIAL" — pay the approved stores' shares now (default)
+  //   "HOLD"    — nothing is payable until every store has approved
+  RUNTIME.partialPay = (doc && doc.partialPay === "HOLD") ? "HOLD" : "PARTIAL";
 }
+function partialPayPolicy() { return RUNTIME.partialPay || "PARTIAL"; }
 
 function getVpThreshold() { return RUNTIME.vpThreshold; }
 function directorThresholdFor(directorId) {
@@ -1345,6 +1382,13 @@ function monthLabel(key) {
   return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "numeric" });
 }
 
+/* Dollars that actually went out: the recorded paidAmount (partial pays),
+   else the invoice total. */
+function paidDollars(inv) {
+  return (inv.paidAmount != null && isFinite(Number(inv.paidAmount)))
+    ? Number(inv.paidAmount) : (Number(inv.amount) || 0);
+}
+
 function buildPaidInsights(invoices, sel) {
   sel = sel || {};
   const vendorKey = v => (v || "").trim().toLowerCase();
@@ -1357,26 +1401,28 @@ function buildPaidInsights(invoices, sel) {
   const months = {};                       // respects vendor+store, not month
   paid.filter(i => matchVendor(i) && matchStore(i)).forEach(i => {
     const k = paidMonthKey(i);
-    if (k) months[k] = (months[k] || 0) + (Number(i.amount) || 0);
+    if (k) months[k] = (months[k] || 0) + paidDollars(i);
   });
 
   const vendors = {};                      // respects month+store, not vendor
   paid.filter(i => matchMonth(i) && matchStore(i)).forEach(i => {
     const k = (i.vendor || "").trim() || "(no vendor)";
-    vendors[k] = (vendors[k] || 0) + (Number(i.amount) || 0);
+    vendors[k] = (vendors[k] || 0) + paidDollars(i);
   });
 
   const stores = {};                       // respects month+vendor, not store
   paid.filter(i => matchMonth(i) && matchVendor(i)).forEach(i => {
     const ch = getChains(i);
     const approvedChains = ch.filter(c => c.status === "APPROVED");
-    const share = approvedChains.length
-      ? (Number(i.amount) || 0) / approvedChains.length : 0;
-    (approvedChains.length ? approvedChains : ch).forEach(c => {
+    const pool = approvedChains.length ? approvedChains : ch;
+    const anyOwn = pool.some(chainHasOwnAmount);
+    pool.forEach(c => {
       const key = c.storeId || c.storeName || "?";
       if (!stores[key]) stores[key] = { id: c.storeId, name: c.storeName || "(store)", total: 0 };
-      stores[key].total += approvedChains.length ? share
-        : (Number(i.amount) || 0) / (ch.length || 1);
+      // Real per-store dollars when the invoice carries them; even split for
+      // older multi-store records that don't.
+      stores[key].total += anyOwn ? chainAmount(i, c)
+        : (Number(i.amount) || 0) / (pool.length || 1);
     });
   });
 
@@ -1387,7 +1433,7 @@ function buildPaidInsights(invoices, sel) {
     vendors: Object.entries(vendors).map(([name, total]) => ({ name, total }))
       .sort((a, b) => b.total - a.total),
     stores: Object.values(stores).sort((a, b) => b.total - a.total),
-    grand: { total: inSel.reduce((n, i) => n + (Number(i.amount) || 0), 0),
+    grand: { total: inSel.reduce((n, i) => n + paidDollars(i), 0),
              count: inSel.length }
   };
 }
@@ -1412,7 +1458,8 @@ function buildOverdueRows(invoices, now) {
         "Was Due": sla.dueAt ? new Date(sla.dueAt).toLocaleString() : "",
         "Vendor": inv.vendor || "",
         "Invoice #": inv.invoiceNumber || "",
-        "Amount": Number(inv.amount) || 0,
+        "Amount": chainAmount(inv, chain),
+        "Invoice Total": Number(inv.amount) || 0,
         "Store": chain.storeName || "",
         "Store #": chain.storeNumber || "",
         "Division": chain.division || "",
@@ -1456,7 +1503,8 @@ function buildReportRows(invoices, f) {
       rows.push({
         "Invoice #": inv.invoiceNumber || "",
         "Vendor": inv.vendor || "",
-        "Amount": Number(inv.amount) || 0,
+        "Amount": chainAmount(inv, chain),
+        "Invoice Total": Number(inv.amount) || 0,
         "Store": chain.storeName || "",
         "Store #": chain.storeNumber || "",
         "Entity": chain.entity || "",
@@ -1535,11 +1583,12 @@ const pathOverridesService = {
 };
 
 const thresholdsService = {
-  async save(vpThreshold, directorThresholds, user) {
+  async save(vpThreshold, directorThresholds, user, partialPay) {
     await window.FS.setDoc(window.FS.doc(window.FS.db, "invoices", THRESHOLDS_DOC), {
       _config: true,
       vpThreshold: Number(vpThreshold) || CFG.vpThreshold,
       directorThresholds: directorThresholds || {},
+      partialPay: partialPay === "HOLD" ? "HOLD" : "PARTIAL",
       createdAt: 0,          // keeps it inside the createdAt-ordered subscription
       updatedAt: Date.now(),
       updatedBy: user ? user.name : ""
@@ -1971,7 +2020,7 @@ function FinanceDashboard({ invoices, stores, users, filters, setFilters, onStat
     let paidTotal = 0;
     invoices.forEach(i => {
       if (counts[i.status] !== undefined) counts[i.status]++;
-      if (i.status === "PAID") paidTotal += Number(i.amount) || 0;
+      if (i.status === "PAID") paidTotal += paidDollars(i);
     });
     return { counts, paidTotal, total: invoices.length };
   }, [invoices]);
@@ -2456,6 +2505,32 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
   const selStores = stores.filter(s => storeIds.includes(s.id));
   const amt   = parseFloat(amount) || 0;
 
+  // ---- Combo invoices: each store's share. Required (and must add up to
+  //      the total) whenever more than one store is selected. ----
+  const [alloc, setAlloc] = useState({});           // storeId -> "string"
+  const isCombo = selStores.length > 1;
+  const round2 = n => Math.round(n * 100) / 100;
+  const allocNum = id => parseFloat(alloc[id]) || 0;
+  const allocSum = round2(selStores.reduce((n, st) => n + allocNum(st.id), 0));
+  const allocDiff = round2(amt - allocSum);
+  const allocFilled = selStores.every(st => (alloc[st.id] || "").trim() !== "");
+  const allocOk = !isCombo || (amt > 0 && allocFilled && Math.abs(allocDiff) < 0.005);
+  function splitEvenly() {
+    if (!selStores.length || !(amt > 0)) return;
+    const base = Math.floor(amt * 100 / selStores.length) / 100;
+    const next = {};
+    let used = 0;
+    selStores.forEach((st, i) => {
+      const v = i === selStores.length - 1 ? round2(amt - used) : base;
+      used = round2(used + v);
+      next[st.id] = v.toFixed(2);
+    });
+    setAlloc(next);
+  }
+  const allocations = isCombo
+    ? Object.fromEntries(selStores.map(st => [st.id, round2(allocNum(st.id))]))
+    : null;
+
   // Duplicate guard: same vendor + same invoice # as an existing invoice.
   const norm = x => String(x || "").trim().toLowerCase().replace(/\s+/g, " ");
   const dupOf = useMemo(() => {
@@ -2481,9 +2556,14 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
   const onlyOffice = selStores.length > 0 && selStores.every(st => st.id === OFFICE_STORE_ID);
 
   function chainsFor(when) {
-    return selStores.map(st => st.id === OFFICE_STORE_ID
-      ? buildOfficeChain(officeApprovers, amt, users, when)
-      : buildChains([st], amt, users, when, rateRule)[0]);
+    return selStores.map(st => {
+      if (st.id === OFFICE_STORE_ID) {
+        const c = buildOfficeChain(officeApprovers, amt, users, when);
+        if (allocations) c.amount = allocations[st.id];
+        return c;
+      }
+      return buildChains([st], amt, users, when, rateRule, allocations)[0];
+    });
   }
   const previewChains = selStores.length ? chainsFor(Date.now()) : [];
 
@@ -2526,6 +2606,15 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
       ", created " + (dupOf.createdAt ? new Date(dupOf.createdAt).toLocaleDateString() : "earlier") +
       "). It was not uploaded again.");
 
+    if (isCombo && !allocOk) {
+      return setErr(!allocFilled
+        ? "Enter each store's share of this invoice."
+        : "Store amounts add up to $" + allocSum.toLocaleString(undefined, { minimumFractionDigits: 2 }) +
+          " but the invoice is $" + amt.toLocaleString(undefined, { minimumFractionDigits: 2 }) + " — " +
+          (allocDiff > 0
+            ? "$" + allocDiff.toLocaleString(undefined, { minimumFractionDigits: 2 }) + " unassigned."
+            : "$" + Math.abs(allocDiff).toLocaleString(undefined, { minimumFractionDigits: 2 }) + " over."));
+    }
     const now = Date.now();
     if (officeSelected && officeApprovers.length === 0 && amt < getVpThreshold())
       return setErr("Choose at least one approver for DPM Office.");
@@ -2548,6 +2637,8 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
         division: [...new Set(selStores.map(s => s.division))].join(" / "),
         // One independent chain per store.
         chains,
+        isCombo,
+        allocations: allocations || null,
         status: deriveStatus(chains),
         fileUrl: file ? file.url : null,
         fileName: file ? file.name : null,
@@ -2557,7 +2648,7 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
         createdByName: currentUser.name
       });
       rememberVendor(vendor);
-      setVendor(""); setAmount(""); setInvoiceNumber(""); setFile(null); setStoreIds([]);
+      setVendor(""); setAmount(""); setInvoiceNumber(""); setFile(null); setStoreIds([]); setAlloc({});
       onDone && onDone();
     } catch (e) {
       setErr(e.message || "Could not save.");
@@ -2623,7 +2714,14 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
             <div className="mt-3 space-y-5">
               {previewChains.map((c, ci) => (
                 <div key={ci}>
-                  <p className="text-base font-semibold text-slate-900">{c.storeName}</p>
+                  <p className="text-base font-semibold text-slate-900">
+                    {c.storeName}
+                    {isCombo && (
+                      <span className="ml-2 rounded-full bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white">
+                        ${(c.amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      </span>
+                    )}
+                  </p>
                   <p className="text-xs text-slate-500">
                     {[c.division, c.entity].filter(Boolean).join(" · ") || "—"}
                   </p>
@@ -2695,6 +2793,51 @@ function NewInvoice({ stores, users, currentUser, knownVendors, vendorRules, inv
               <StorePicker stores={stores} selectedIds={storeIds} onChange={setStoreIds} />
             </div>
           </label>
+
+          {isCombo && (
+            <div className={"sm:col-span-2 rounded-lg border p-3 " +
+              (amt > 0 && allocFilled && !allocOk ? "border-red-300 bg-red-50/60"
+               : allocOk && amt > 0 ? "border-emerald-300 bg-emerald-50/50"
+               : "border-amber-300 bg-amber-50/60")}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-slate-900">
+                  Combo invoice — how much is each store's?
+                </p>
+                <button type="button" onClick={splitEvenly} disabled={!(amt > 0)}
+                  className="rounded-full border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-40">
+                  Split evenly
+                </button>
+              </div>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Each store's approvers see their own line. Lines for the same store on
+                the vendor's invoice go in as one summed amount.
+              </p>
+              <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                {selStores.map(st => (
+                  <label key={st.id} className="flex items-center gap-2 rounded-lg bg-white px-2 py-1.5 text-sm">
+                    <span className="min-w-0 flex-1 truncate text-slate-800">
+                      <span className="font-medium">{st.storeNumber}</span> {st.name.replace(/#\S+\s*/, "")}
+                    </span>
+                    <span className="text-slate-400">$</span>
+                    <input inputMode="decimal" placeholder="0.00"
+                      value={alloc[st.id] || ""}
+                      onChange={e => setAlloc({ ...alloc, [st.id]: e.target.value.replace(/[^0-9.]/g, "") })}
+                      className="w-24 rounded-md border border-slate-300 px-2 py-1 text-right text-sm" />
+                  </label>
+                ))}
+              </div>
+              <p className={"mt-2 text-sm font-semibold " +
+                (!(amt > 0) ? "text-slate-500" : allocOk ? "text-emerald-700" : "text-red-700")}>
+                {!(amt > 0)
+                  ? "Enter the invoice total above first."
+                  : "Assigned $" + allocSum.toLocaleString(undefined, { minimumFractionDigits: 2 }) +
+                    " of $" + amt.toLocaleString(undefined, { minimumFractionDigits: 2 }) +
+                    (allocOk ? " ✓" : allocDiff > 0
+                      ? " — $" + allocDiff.toLocaleString(undefined, { minimumFractionDigits: 2 }) + " still unassigned"
+                      : " — $" + Math.abs(allocDiff).toLocaleString(undefined, { minimumFractionDigits: 2 }) + " over the total")}
+              </p>
+            </div>
+          )}
 
           {officeSelected && (
             <div className="rounded-lg border border-violet-200 bg-violet-50/60 p-3">
@@ -2985,7 +3128,15 @@ function ChainCard({ inv, chain, chainIdx, currentUser, now, onAct, canFinance, 
        "border-slate-200 bg-white")}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
-          <p className="truncate text-sm font-medium text-slate-900">{chain.storeName}</p>
+          <p className="truncate text-sm font-medium text-slate-900">
+            {chain.storeName}
+            {chainHasOwnAmount(chain) && getChains(inv).length > 1 && (
+              <span className="ml-2 rounded-full bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white"
+                    title={"This store's share of the $" + Number(inv.amount).toLocaleString(undefined, { minimumFractionDigits: 2 }) + " invoice"}>
+                ${Number(chain.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })} this store
+              </span>
+            )}
+          </p>
           <p className="truncate text-xs text-slate-500">
             {[chain.division, chain.entity].filter(Boolean).join(" · ") || "—"}
           </p>
@@ -3130,6 +3281,9 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
             <p className="font-medium text-slate-900">{inv.vendor}</p>
             <span className="text-sm text-slate-500">
               ${Number(inv.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              {chains.length > 1 && chains.some(chainHasOwnAmount) && (
+                <span className="ml-1 text-xs text-slate-400">total · {chains.length} stores</span>
+              )}
             </span>
             {inv.status === "PENDING" && worst && (
               <span title={slaTitle(worst)}>
@@ -3277,24 +3431,46 @@ function InvoiceRow({ inv, users, currentUser, now, onAct, onMarkPaid, onDelete,
           )}
         </div>
       )}
-      {canFinance && inv.status === "APPROVED" && resolved && approved > 0 && (
-        <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3">
-          <p className="text-sm text-emerald-800">
-            {(() => {
-              const ok = chains.filter(c => c.status === "APPROVED").map(c => c.storeName || "(store)");
-              const list = ok.length <= 3 ? ok.join(", ")
-                : ok.slice(0, 3).join(", ") + " +" + (ok.length - 3) + " more";
-              return approved === chains.length
+      {canFinance && inv.status === "APPROVED" && resolved && approved > 0 && (() => {
+        const okChains = chains.filter(c => c.status === "APPROVED");
+        const ok = okChains.map(c => c.storeName || "(store)");
+        const list = ok.length <= 3 ? ok.join(", ")
+          : ok.slice(0, 3).join(", ") + " +" + (ok.length - 3) + " more";
+        const partial = approved < chains.length;
+        const held = partial && partialPayPolicy() === "HOLD";
+        const pay = payableAmount(inv);
+        const fmt = n => "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2 });
+        if (held) return (
+          <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3">
+            <p className="text-sm font-semibold text-amber-900">
+              ⏸ On hold — {chains.length - approved} of {chains.length} store{chains.length - approved > 1 ? "s" : ""} rejected
+            </p>
+            <p className="mt-0.5 text-xs text-amber-800">
+              Settings say combo invoices aren't paid until every store approves.
+              {fmt(pay)} is approved so far ({list}). Resolve the rejected store{chains.length - approved > 1 ? "s" : ""}
+              {" "}(re-open via Add approver) or switch the policy in Settings.
+            </p>
+          </div>
+        );
+        return (
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg bg-emerald-50 p-3">
+            <p className="text-sm text-emerald-800">
+              {!partial
                 ? (chains.length === 1 ? list + " approved." : "All " + chains.length + " stores approved: " + list + ".")
-                : approved + " of " + chains.length + " approved — pay " + list + " only.";
-            })()}
-          </p>
-          <button onClick={() => onMarkPaid(inv)}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
-            Mark paid
-          </button>
-        </div>
-      )}
+                : approved + " of " + chains.length + " approved — pay " + list + " only."}
+              {partial && (
+                <span className="ml-1 font-semibold">
+                  Pay {fmt(pay)}{chains.some(chainHasOwnAmount) ? "" : " (even split)"} of the {fmt(Number(inv.amount) || 0)} invoice.
+                </span>
+              )}
+            </p>
+            <button onClick={() => onMarkPaid(inv)}
+              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700">
+              Mark paid{partial ? " — " + fmt(pay) : ""}
+            </button>
+          </div>
+        );
+      })()}
 
       {(open || mineAny) && (
         <CommentThread invoiceId={inv.id} inv={inv} currentUser={currentUser}
@@ -3642,7 +3818,9 @@ function IncompletePathsPanel({ stores, users, pathOverrides, currentUser }) {
 function ThresholdsPanel({ users, thresholds, currentUser }) {
   const [vpDraft, setVpDraft] = useState(null);          // string while editing
   const [doDraft, setDoDraft] = useState(null);          // {dirId: string}
+  const [ppDraft, setPpDraft] = useState(null);          // "PARTIAL" | "HOLD"
   const [msg, setMsg] = useState("");
+  const ppVal = ppDraft || partialPayPolicy();
 
   const directors = useMemo(() =>
     Object.values(users || {})
@@ -3656,7 +3834,7 @@ function ThresholdsPanel({ users, thresholds, currentUser }) {
     const v = (thresholds.directorThresholds || {})[id];
     return v ? String(v) : "";
   };
-  const dirty = vpDraft !== null || doDraft !== null;
+  const dirty = vpDraft !== null || doDraft !== null || ppDraft !== null;
 
   async function save() {
     setMsg("");
@@ -3669,8 +3847,8 @@ function ThresholdsPanel({ users, thresholds, currentUser }) {
       if (raw && n > 0) dts[d.id] = n;
     });
     try {
-      await thresholdsService.save(vp, dts, currentUser);
-      setVpDraft(null); setDoDraft(null);
+      await thresholdsService.save(vp, dts, currentUser, ppVal);
+      setVpDraft(null); setDoDraft(null); setPpDraft(null);
       setMsg("✓ Saved. New invoices route with these numbers immediately; run " +
              "Approval path repair above to reconcile pending ones.");
     } catch (e) { setMsg("Couldn't save: " + (e.message || "error")); }
@@ -3682,9 +3860,12 @@ function ThresholdsPanel({ users, thresholds, currentUser }) {
       <p className="mt-1 text-sm text-slate-500">
         Stored in the database, read live by every device — this file carries
         no baked-in numbers. The VP joins chains at or above his threshold. A
-        Director with a threshold is skipped on invoices under it, <span
+        Director with a threshold is skipped when <span className="font-medium">their
+        store's share</span> of the invoice is under it (on a combo invoice,
+        each store is judged by its own line), <span
         className="font-medium">but only when a District Manager is on the
         chain</span> — a Director who is the only approver always stays.
+        The VP always goes by the invoice total.
       </p>
 
       <div className="mt-4 flex items-center justify-between gap-3 rounded-lg bg-slate-50 px-3 py-2">
@@ -3719,6 +3900,24 @@ function ThresholdsPanel({ users, thresholds, currentUser }) {
         {directors.length === 0 && (
           <p className="text-sm text-slate-400">No Directors found in the directory.</p>
         )}
+      </div>
+
+      <p className="mt-4 text-xs font-medium uppercase tracking-wide text-slate-500">
+        Combo invoices — when some stores reject
+      </p>
+      <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
+        {[["PARTIAL", "Pay the approved stores now",
+           "Finance pays the approved stores' shares as soon as every store has answered. Rejected stores are re-billed separately."],
+          ["HOLD", "Hold until every store approves",
+           "Nothing is payable while any store is rejected — the whole invoice waits until the rejected stores are resolved."]
+         ].map(([v, title, body]) => (
+          <button key={v} type="button" onClick={() => { setMsg(""); setPpDraft(v); }}
+            className={"rounded-lg border-2 p-3 text-left " +
+              (ppVal === v ? "border-slate-900 bg-slate-50" : "border-slate-200 bg-white hover:border-slate-400")}>
+            <p className="text-sm font-semibold text-slate-900">{ppVal === v ? "● " : "○ "}{title}</p>
+            <p className="mt-0.5 text-xs text-slate-500">{body}</p>
+          </button>
+        ))}
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -4645,7 +4844,8 @@ function App() {
     const ts = Date.now();
     await invoiceService.update(inv.id, {
       status: "PAID", paidAt: ts, updatedAt: ts,
-      paidBy: session.id, paidByName: session.name
+      paidBy: session.id, paidByName: session.name,
+      paidAmount: payableAmount(inv)          // the approved stores' shares
     });
   }
 }
