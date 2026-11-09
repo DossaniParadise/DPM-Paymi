@@ -4449,10 +4449,18 @@ function App() {
   }, [deepLink, session]);
 
   /* "Needs me" is always empty for a viewer and Settings is not theirs, so
-     send them to the only tab that means anything. Placed with the other
+     send them to the only tab that means anything, and open it on Paid.
+     The Paid default is applied ONCE per sign-in — set it on every render and
+     the Status dropdown could never be changed. Placed with the other
      effects, above the early returns, because hook order must not change. */
+  const viewerLanded = useRef(false);
   useEffect(() => {
-    if (session && session.role === "VIEWER" && tab !== "all") setTab("all");
+    if (!session || session.role !== "VIEWER") { viewerLanded.current = false; return; }
+    if (tab !== "all") setTab("all");
+    if (!viewerLanded.current) {
+      viewerLanded.current = true;
+      setFilters(f => ({ ...f, status: "PAID" }));
+    }
   }, [session, tab]);
 
   // --- Early returns (no hooks may appear below this line) ------------------
@@ -4520,17 +4528,6 @@ function App() {
       {err && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-800">
           {err}
-        </div>
-      )}
-
-      {isViewer && (
-        <div className="mb-4 rounded-lg border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
-          <p className="font-semibold">View only</p>
-          <p className="mt-1">
-            You can read every invoice, its full approval path and every comment.
-            Approving, rejecting, commenting, uploading and settings are not
-            available on this account.
-          </p>
         </div>
       )}
 
